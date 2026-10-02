@@ -1,4 +1,5 @@
-import { readBytes } from "./io.ts";
+import { readBytes, transcriptBytes } from "./io.ts";
+import { canonicalMessage, blockSignature } from "./canonical.ts";
 import { taskNotification, notificationText, notificationState, type NotificationAgent } from "./notifications.ts";
 import { extractMetadata, messageMetadata, originalIdentity, isoTimestamp, validateMessageMetadata, validateSessionMetadata } from "./metadata.ts";
 import { childFiles, nativeMedia } from "./continuity.ts";
@@ -79,6 +80,7 @@ function claude(rows: Row[], history: "full" | "active" = "full", branch?: strin
       messages.push(restoreMessage(r, { role: str(m.role) ?? String(r.type), blocks: contentBlocks(m.content), ...originalIdentity(r, str(r.uuid), str(r.timestamp)), metadata: messageMetadata("claude", r, m) }));
     } else if (r.type === "system" && r.subtype === "compact_boundary" && !str(r.logicalParentUuid)) warnings.push("Claude compaction boundary has no logical parent; earlier context may exist only in its summary.");
   }
+  restoreOmitted(rows, messages);
   return { sourceId: str(candidates.findLast(r => str(r.sessionId))?.sessionId), cwd, messages, warnings, metadata: extractMetadata("claude", rows) };
 }
 function codex(rows: Row[], history: "full" | "active" = "full"): ReturnType<typeof claude> {
@@ -97,7 +99,8 @@ function codex(rows: Row[], history: "full" | "active" = "full"): ReturnType<typ
       warnings.push("Active Codex context selected from its last compaction; older recorded messages remain in the source archive.");
     }
   }
-  for (const r of rows) {
+  const entries: { index: number; record: Row; message: Message }[] = [];
+  for (const [index, r] of rows.entries()) {
     const p = row(r.payload), kind = str(p.type);
     let role = "assistant", blocks: Block[] = [];
     if (row(row(r.session_bridge).message).generated === true) continue;
@@ -107,16 +110,73 @@ function codex(rows: Row[], history: "full" | "active" = "full"): ReturnType<typ
         blocks = [{ kind: "tool_call", text: text(p.arguments ?? p.input ?? p), name: str(p.name) ?? kind, callId: str(p.call_id) ?? str(p.id) }];
       } else if (["function_call_output", "custom_tool_call_output", "local_shell_call_output"].includes(kind ?? "")) {
         role = "user"; const output = p.output ?? p, parts = Array.isArray(output) ? contentBlocks(output) : [];
-        blocks = [{ kind: "tool_result", text: parts.length ? parts.map(b => b.kind === "media" ? "[Attachment]" : b.text).join("\n") : text(output), callId: str(p.call_id) }, ...parts.filter(b => b.kind === "media")];
+        blocks = [{ kind: "tool_result", text: parts.length ? parts.map(b => b.kind === "media" ? "[Attachment]" : b.text).join("\n") : text(output), callId: str(p.call_id), ...(p.is_error === true ? { isError: true } : {}) }, ...parts.filter(b => b.kind === "media")];
       } else if (kind === "reasoning") blocks = [{ kind: "reasoning", text: "" }];
       else blocks = [{ kind: "unsupported", text: text(p), format: kind }];
     } else if (r.type === "compacted") {
       warnings.push("Codex compaction detected; full recorded history transfers and may exceed the target context window.");
       if (str(p.message)) blocks = [{ kind: "summary", text: String(p.message) }];
     }
-    if (blocks.length) messages.push(restoreMessage(r, { role, blocks, ...originalIdentity(r, str(p.id), str(r.timestamp)), metadata: messageMetadata("codex", r, p) }));
+    if (blocks.length) entries.push({ index, record: r, message: restoreMessage(r, { role, blocks, ...originalIdentity(r, str(p.id), str(r.timestamp)), metadata: messageMetadata("codex", r, p) }) });
   }
-  if (!messages.length) throw new BridgeError("EMPTY_SESSION", "No response items in Codex rollout.");
+  const identities = new Set(rows.filter(r => r.type === 'response_item' && row(r.payload).type === 'message').map(r => str(row(r.payload).id)).filter(Boolean));
+  const importedLinks = new Set(meta.originator === 'baton' ? rows.filter(r => row(r.payload).type === 'collab_agent_spawn_end').map(r => str(row(r.payload).call_id)).filter(Boolean) : []);
+  const counts = new Map<string, number>(), toolIds = new Map<string, number>();
+  const key = (r: Row, m: Message, b: Block) => {
+    const scope = ['tool_call', 'tool_result'].includes(b.kind) ? '' : isoTimestamp(str(r.timestamp)) ?? '';
+    return `${scope}:${blockSignature(b.kind === 'tool_call' ? 'assistant' : b.kind === 'tool_result' || b.kind === 'media' ? 'user' : m.role, b)}`;
+  };
+  for (const e of entries) for (const b of e.message.blocks) {
+    const k = key(e.record, e.message, b); counts.set(k, (counts.get(k) ?? 0) + 1);
+    if (b.callId && ['tool_call', 'tool_result'].includes(b.kind)) { const identity = `${b.kind}:${b.callId}`; toolIds.set(identity, (toolIds.get(identity) ?? 0) + 1); }
+  }
+  const latest = new Map<string, number>();
+  rows.forEach((r, index) => {
+    const p = row(r.payload), id = str(row(p.item).id);
+    if (r.type === 'event_msg' && ['item_started', 'item_completed'].includes(String(p.type)) && id) {
+      const prior = latest.get(id);
+      if (p.type === 'item_completed' || prior === undefined || row(rows[prior].payload).type !== 'item_completed') latest.set(id, index);
+    }
+  });
+  for (const [index, r] of rows.entries()) {
+    const p = row(r.payload), item = row(p.item), id = str(item.id);
+    if (r.type !== 'event_msg' || !['item_started', 'item_completed'].includes(String(p.type)) || (id && (latest.get(id) !== index || identities.has(id) || importedLinks.has(id))) || row(row(r.session_bridge).message).generated === true) continue;
+    const m = canonicalMessage(r); if (!m) continue;
+    let matchedCall = false;
+    m.blocks = m.blocks.filter(b => {
+      const k = key(r, m, b), count = counts.get(k) ?? 0, identity = `${b.kind}:${b.callId}`, byId = b.callId ? toolIds.get(identity) ?? 0 : 0;
+      if (count || byId) {
+        if (count) counts.set(k, count - 1); if (byId) toolIds.set(identity, byId - 1);
+        if (b.kind === 'tool_call') matchedCall = true;
+        return false;
+      }
+      // Older Baton imports closed missing results for display only.
+      if (matchedCall && meta.originator === 'baton' && str(item.namespace)?.endsWith('_history') && b.kind === 'tool_result' && ['Source call has no recorded result; imported inactive.', 'Source call ID was reused without a recorded result; imported inactive.'].includes(b.text)) return false;
+      return true;
+    });
+    if (!m.blocks.length) continue;
+    if (m.blocks.some(b => b.kind === 'unsupported')) warnings.push(`Codex ${String(item.type)} event preserved as labeled historical context; no native cross-client representation.`);
+    if (p.type === 'item_started') warnings.push(`Incomplete Codex ${String(item.type)} event imported as inactive history.`);
+    m.metadata = messageMetadata('codex', r, item);
+    entries.push({ index, record: r, message: m });
+  }
+  const generatedMirrors = new Set(rows.filter(r => r.type === 'response_item' && row(row(r.session_bridge).message).generated === true).flatMap(r => contentBlocks(row(r.payload).content).filter(b => b.kind === 'text').map(b => `${str(r.timestamp)}:${b.text}`)));
+  const mirrors = new Map<string, number>();
+  for (const e of entries) for (const b of e.message.blocks) {
+    const k = key(e.record, e.message, b); mirrors.set(k, (mirrors.get(k) ?? 0) + 1);
+  }
+  for (const [index, r] of rows.entries()) {
+    const p = row(r.payload);
+    if (r.type !== 'event_msg' || !['user_message', 'agent_message'].includes(String(p.type)) || !str(p.message)) continue;
+    if (meta.originator === 'baton' && generatedMirrors.has(`${str(r.timestamp)}:${p.message}`)) continue;
+    const m: Message = { role: p.type === 'user_message' ? 'user' : 'assistant', timestamp: str(r.timestamp), blocks: [{ kind: 'text', text: String(p.message) }], metadata: messageMetadata('codex', r, p) };
+    const k = key(r, m, m.blocks[0]), count = mirrors.get(k) ?? 0;
+    if (count) { mirrors.set(k, count - 1); continue; }
+    entries.push({ index, record: r, message: m });
+  }
+  messages.push(...entries.sort((a, b) => a.index - b.index).map(e => e.message));
+  restoreOmitted(rows, messages);
+  if (!messages.length) throw new BridgeError("EMPTY_SESSION", "No conversation items in Codex rollout.");
   return { sourceId: str(meta.id) ?? str(meta.session_id), cwd: str(meta.cwd), messages, warnings, metadata: extractMetadata("codex", originalRows) };
 }
 export function chatgptConversations(data: unknown): Row[] {
@@ -194,13 +254,14 @@ function portable(data: unknown): Session {
 export async function load(path: string, conversation?: string, history: "full" | "active" = "full", options: { branch?: string; children?: boolean; visited?: Set<string> } = {}) {
   path = expand(path);
   if ((await stat(path)).size > 512 * 1024 * 1024) throw new BridgeError("SESSION_TOO_LARGE", "Session exceeds 512 MiB.");
-  const raw = await readBytes(path), decoded = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  const raw = await readBytes(path), decoded = new TextDecoder("utf-8", { fatal: true }).decode(await transcriptBytes(path, raw));
+  let records: Row[] | undefined;
   let session: Session;
   const relatedSources: { path: string; raw: Uint8Array }[] = [];
-  if (extname(path) === ".jsonl") {
-    const rows = parseJsonl(decoded), source = rows.some(r => r.type === "session_meta") ? "codex" : "claude";
+  if (extname(path) === ".jsonl" || path.endsWith(".jsonl.zst")) {
+    const rows = records = parseJsonl(decoded), source = rows.some(r => r.type === "session_meta") ? "codex" : "claude";
     if (source === "codex" && options.branch) throw new BridgeError("UNSUPPORTED_BRANCH", "Codex rollouts are sequential. Select a different rollout instead.");
-    const parsed = source === "codex" ? codex(rows, history) : claude(rows, history, options.branch, path.includes(`${sep}subagents${sep}`));
+    const parsed = source === "codex" ? codex(rows, history) : claude(rows, history, options.branch, path.includes(`${sep}subagents${sep}`) || rows.some(r => r.isSidechain === true) && !rows.some(r => ["user", "assistant"].includes(String(r.type)) && r.isSidechain !== true));
     if (source === "codex" && parsed.metadata && !parsed.metadata.title && path.startsWith(roots().codex + sep)) {
       try {
         const index = parseJsonl(await Bun.file(join(roots().codex, "..", "session_index.jsonl")).text());
@@ -225,7 +286,7 @@ export async function load(path: string, conversation?: string, history: "full" 
       if (visited.size >= 128) { session.warnings.push("Subagent discovery stopped at 128 transcripts; remaining children require separate conversion."); break; }
       try {
         const loaded = await load(child, undefined, history, { visited });
-        const childRows = parseJsonl(Buffer.from(loaded.raw).toString("utf8"));
+        const childRows = loaded.records ?? parseJsonl(Buffer.from(loaded.raw).toString("utf8"));
         const childMeta = row(childRows.find(r => r.type === "session_meta")?.payload);
         const spawnMeta = row(row(row(childMeta.source).subagent).thread_spawn);
         let agentMeta: Row = {};
@@ -256,26 +317,81 @@ export async function load(path: string, conversation?: string, history: "full" 
     if (row(data).format === "session-bridge/v1") { session = portable(data); if (options.branch && options.branch !== session.selectedBranch) throw new BridgeError("UNSUPPORTED_BRANCH", "Select alternate branches from source-original.json or source-original.jsonl."); }
     else session = { format: "session-bridge/v1", source: "chatgpt", ...chatgpt(data, conversation, options.branch), branches: chatgptBranches(data, conversation), selectedBranch: options.branch ?? chatgptBranches(data, conversation).find(b => b.current)?.id };
   }
+  // Collaboration references can point to peers whose parents are outside this
+  // transcript family. Keep their evidence without inventing child ancestry.
+  if (records && session.context && !options.visited) {
+    const agents = new Map(session.context.filter(c => c.kind === 'subagent' && c.sourceId).map(c => [c.sourceId!, c]));
+    for (const c of agents.values()) {
+      let parent = c.parentSourceId; const seen = new Set<string>();
+      while (parent && parent !== session.sourceId && agents.has(parent) && !seen.has(parent)) { seen.add(parent); parent = agents.get(parent)!.parentSourceId; }
+      if (parent && parent !== session.sourceId && !agents.has(parent)) {
+        c.kind = 'communication';
+        session.warnings.push(`Referenced agent ${c.sourceId} has an unavailable parent; its transcript is preserved as historical communication.`);
+      }
+    }
+  }
   session = { ...session, warnings: unique(session.warnings), sourcePath: path, sourceSha256: hash(raw) };
   portable(session);
-  return { session, raw, path, relatedSources };
+  return { session, raw, path, relatedSources, records };
 }
 export function native(s: Session, target: Target, id: string, cwd: string, timestamp: string, notificationAgents: Map<string, NotificationAgent> = new Map()): Row[] {
   const mapped: ReturnType<typeof mappedMessages> = [{ role: "user", id: undefined, metadata: undefined, text: `Conversation transferred from ${s.source} by baton. Prior tool activity is historical, not pending actions. Continue from the last turn using this app's current tools and permissions. Workspace files are checked, not copied. Supplemental history follows.\n\n${continuityText(s)}`, timestamp, originalRole: "user", blocks: [] }, ...mappedMessages(s)];
-  const sessionBridge = { version: 1, session: { source: s.source, sourceId: s.sourceId, metadata: s.metadata, title: s.title, branches: s.branches?.map(({ id, current }) => ({ id, current })), selectedBranch: s.selectedBranch, context: s.context?.map(c => ({ ...c, messages: c.messages?.map(m => ({ ...m, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) })) })), workspace: s.workspace } };
+  const sessionBridge = { version: 1, session: { source: s.source, sourceId: s.sourceId, metadata: s.metadata, title: s.title,
+    omittedMessages: s.messages.flatMap((m, index) => renderBlocks(m.blocks) ? [] : [{ index, message: { ...m, blocks: m.blocks.map(b => b.kind === 'reasoning' ? { kind: b.kind, text: '', format: b.format } : b) } }]), branches: s.branches?.map(({ id, current }) => ({ id, current })), selectedBranch: s.selectedBranch, context: s.context?.map(c => ({ ...c, messages: c.messages?.map(m => ({ ...m, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) })) })), workspace: s.workspace } };
   const messageBridge = (m: (typeof mapped)[number]) => ({ version: 1, message: { id: m.id, timestamp: m.timestamp, metadata: m.metadata, role: m.originalRole, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) } });
   if (target === "claude") {
     let parent: string | null = null;
-    const records: Row[] = mapped.map((m, index) => {
-      const mid = randomUUID(), msg: Row = { role: m.role, content: m.role === "user" && !nativeMedia(m.blocks, "claude").length ? m.text : [{ type: "text", text: m.text }, ...(m.role === "user" ? nativeMedia(m.blocks, "claude") : [])] };
-      if (m.role === "assistant") Object.assign(msg, { id: `msg_${mid.replaceAll("-", "")}`, type: "message", model: m.metadata?.model ?? "baton", stop_reason: "end_turn", stop_sequence: null,
-        usage: m.metadata?.provider === "claude" && m.metadata.usage ? m.metadata.usage : { input_tokens: 0, output_tokens: 0 } });
-      const record = { type: m.role, uuid: mid, parentUuid: parent, isSidechain: false, sessionId: id, cwd,
-        timestamp: isoTimestamp(m.timestamp) ?? timestamp, gitBranch: s.metadata?.git?.branch,
-        userType: "external", version: "2.1.287", message: msg,
-        session_bridge: index === 0 ? { ...sessionBridge, message: { generated: true } } : messageBridge(m) };
-      parent = mid; return record;
-    });
+    const records: Row[] = [];
+    const pending = new Map<string, string>();
+    const generated = { version: 1, message: { generated: true } };
+    const append = (role: string, content: unknown, m: (typeof mapped)[number], bridge: Row) => {
+      const mid = randomUUID(), msg: Row = { role, content };
+      if (role === 'assistant') Object.assign(msg, { id: `msg_${mid.replaceAll('-', '')}`, type: 'message', model: m.metadata?.model ?? 'baton',
+        stop_reason: arr(content).some(b => row(b).type === 'tool_use') ? 'tool_use' : 'end_turn', stop_sequence: null,
+        usage: m.metadata?.provider === 'claude' && m.metadata.usage ? m.metadata.usage : { input_tokens: 0, output_tokens: 0 } });
+      records.push({ type: role, uuid: mid, parentUuid: parent, isSidechain: false, sessionId: id, cwd,
+        timestamp: isoTimestamp(m.timestamp) ?? timestamp, gitBranch: s.metadata?.git?.branch, userType: 'external', version: '2.1.287', message: msg, session_bridge: bridge });
+      parent = mid;
+    };
+    const close = (callId: string, m: (typeof mapped)[number]) => {
+      const destinationId = pending.get(callId); if (!destinationId) return;
+      append('user', [{ type: 'tool_result', tool_use_id: destinationId, is_error: true, content: 'Source call has no recorded result; imported inactive.' }], m, generated);
+      pending.delete(callId);
+    };
+    for (const [index, m] of mapped.entries()) {
+      const bridge = index === 0 ? { ...sessionBridge, message: { generated: true } } : messageBridge(m);
+      if (!m.blocks.some(b => b.kind === 'tool_call' || b.kind === 'tool_result') || !['user', 'assistant'].includes(m.originalRole)) {
+        const notice = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
+        const content = notice ? notificationText(notice) : m.text;
+        append(notice ? 'assistant' : m.role, m.role === 'user' && !nativeMedia(m.blocks, 'claude').length ? content : [{ type: 'text', text: content }, ...(m.role === 'user' ? nativeMedia(m.blocks, 'claude') : [])], m, bridge);
+        continue;
+      }
+      let role = m.role, content: Row[] = [], usedBridge = false;
+      const flush = () => { if (!content.length) return; append(role, content, m, usedBridge ? generated : bridge); usedBridge = true; content = []; };
+      for (const b of m.blocks) {
+        if (b.kind === 'reasoning') continue;
+        const nextRole = b.kind === 'tool_call' ? 'assistant' : b.kind === 'tool_result' || b.kind === 'media' ? 'user' : m.role;
+        if (role !== nextRole) { flush(); role = nextRole; }
+        if (b.kind === 'tool_call') {
+          const sourceId = b.callId ?? randomUUID();
+          if (pending.has(sourceId)) { flush(); close(sourceId, m); }
+          const destinationId = `toolu_${randomUUID().replaceAll('-', '')}`; pending.set(sourceId, destinationId);
+          let input: unknown; try { input = JSON.parse(b.text); } catch { input = { historical_input: b.text }; }
+          if (!Object.keys(row(input)).length && (input === null || typeof input !== 'object' || Array.isArray(input))) input = { historical_input: input };
+          content.push({ type: 'tool_use', id: destinationId, name: (b.name ?? 'source_tool').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128) || 'source_tool', input });
+        } else if (b.kind === 'tool_result') {
+          const sourceId = b.callId ?? randomUUID();
+          if (!pending.has(sourceId)) {
+            flush(); const destinationId = `toolu_${randomUUID().replaceAll('-', '')}`; pending.set(sourceId, destinationId);
+            append('assistant', [{ type: 'tool_use', id: destinationId, name: (b.name ?? 'source_tool_result').replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 128) || 'source_tool_result', input: { source_call_id: b.callId ?? null, historical_orphan: true } }], m, generated);
+          }
+          content.push({ type: 'tool_result', tool_use_id: pending.get(sourceId), content: b.text, ...(b.isError ? { is_error: true } : {}) }); pending.delete(sourceId);
+        } else if (b.kind === 'media') { const media = nativeMedia([b], 'claude'); content.push(...(media.length ? media : [{ type: 'text', text: renderBlocks([b]) }])); }
+        else content.push({ type: 'text', text: renderBlocks([b]) });
+      }
+      flush();
+    }
+    for (const callId of [...pending.keys()]) close(callId, mapped.at(-1)!);
     records.push({ type: "custom-title", customTitle: s.title, sessionId: id });
     if (s.metadata?.tags[0]) records.push({ type: "tag", tag: s.metadata.tags[0], sessionId: id });
     return records;
@@ -363,10 +479,22 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
   return records.map((r, ordinal) => ({ ...r, ordinal }));
 }
 
+function restoreOmitted(records: Row[], messages: Message[]) {
+  const omitted = arr(records.map(r => row(row(r.session_bridge).session)).find(s => Array.isArray(s.omittedMessages))?.omittedMessages).map(row);
+  const positions = new Set<number>();
+  for (const entry of omitted.sort((a, b) => Number(a.index) - Number(b.index))) {
+    if (typeof entry.index !== 'number' || !Number.isSafeInteger(entry.index) || entry.index < 0 || positions.has(entry.index)) throw new BridgeError('INVALID_SCHEMA', 'Invalid retained message position.');
+    positions.add(entry.index);
+    const retained = portable({ format: 'session-bridge/v1', source: 'codex', title: 'retained', warnings: [], messages: [entry.message] }).messages[0];
+    if (renderBlocks(retained.blocks)) throw new BridgeError('INVALID_SCHEMA', 'Retained message must have no resumed content.');
+    messages.splice(Math.min(entry.index, messages.length), 0, retained);
+  }
+}
+
 function restoreMessage(record: Row, fallback: Message): Message {
   const original = row(row(record.session_bridge).message);
   if (!original.blocks) return fallback;
-  const m = { ...fallback, role: str(original.role) ?? fallback.role, blocks: original.blocks };
+  const m = { ...fallback, id: str(original.id), timestamp: original.timestamp as Message['timestamp'], metadata: original.metadata as Message['metadata'], role: str(original.role) ?? fallback.role, blocks: original.blocks };
   return portable({ format: "session-bridge/v1", source: "claude", title: "message", warnings: [], messages: [m] }).messages[0];
 }
 export function branchInventory(rows: Row[], source: "claude" | "codex"): Branch[] {

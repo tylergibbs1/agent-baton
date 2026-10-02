@@ -136,7 +136,10 @@ export async function childFiles(parent: string, source: "claude" | "codex", row
   const files: string[] = [];
   async function scan(dir: string) {
     let entries; try { entries = await readdir(dir, { withFileTypes: true }); } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return; throw e; }
-    for (const e of entries) if (e.isDirectory()) await scan(join(dir, e.name)); else if (e.isFile() && [...ids].some(id => e.name.endsWith(`${id}.jsonl`))) files.push(join(dir, e.name));
+    for (const e of entries) if (e.isDirectory()) await scan(join(dir, e.name)); else if (e.isFile() && [...ids].some(id => (e.name.endsWith(`${id}.jsonl`) || e.name.endsWith(`${id}.jsonl.zst`)))) files.push(join(dir, e.name));
   }
-  await scan(codexRoot); return { paths: files.sort(), missing: [...ids].filter(id => !files.some(path => path.endsWith(`${id}.jsonl`))) };
+  await scan(codexRoot); await scan(join(codexRoot, "..", "archived_sessions"));
+  const preferred = new Map<string, string>();
+  for (const path of files) { const id = basename(path).replace(/\.jsonl(?:\.zst)?$/, "").slice(-36), prior = preferred.get(id); if (!prior || prior.endsWith(".zst") && !path.endsWith(".zst")) preferred.set(id, path); }
+  return { paths: [...preferred.values()].sort(), missing: [...ids].filter(id => !files.some(path => (path.endsWith(`${id}.jsonl`) || path.endsWith(`${id}.jsonl.zst`)))) };
 }

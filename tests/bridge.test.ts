@@ -294,3 +294,19 @@ test("Codex linked child rollouts transfer their findings and unavailable childr
   expect(await readFile(join(out, "conversation.md"), "utf8")).toContain("rounding fails for negative cents");
   expect((await run(["verify", out], dir)).value.ok).toBe(true);
 });
+
+test('compressed Codex discovery, conversion, and archive verification preserve original bytes', async () => {
+  const dir = await sandbox(), store = join(dir, 'codex-home', 'archived_sessions'); await mkdir(store, { recursive: true });
+  const original = await readFile(fixture('codex.jsonl'));
+  const compressed = await Bun.zstdCompress(original);
+  const source = join(store, 'rollout-dddddddd-0000-4000-8000-000000000001.jsonl.zst'); await writeFile(source, compressed);
+  const listed = await run(['list', '--source', 'codex'], dir);
+  expect(listed.exit).toBe(0); expect(JSON.stringify(listed.value)).toContain('dddddddd-0000-4000-8000-000000000001');
+  const out = join(dir, 'compressed');
+  const result = await run(['convert', 'codex:dddddddd-0000-4000-8000-000000000001', '--to', 'claude', '--out', out], dir);
+  expect(result.exit).toBe(0); expect((await readFile(join(out, 'source-original.jsonl.zst'))).equals(compressed)).toBe(true);
+  expect(await readFile(join(out, 'claude.jsonl'), 'utf8')).toContain('amount_cents = 1200');
+  expect((await run(['verify', out], dir)).value.ok).toBe(true);
+  await writeFile(source, 'bad compressed input');
+  expect((await run(['inspect', source], dir)).value.code).toBe('INVALID_COMPRESSION');
+});

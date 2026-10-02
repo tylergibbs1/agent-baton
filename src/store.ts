@@ -7,7 +7,8 @@ import { basename, extname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { BridgeError, expand, roots, row, str, contentBlocks, report, hash, markdown,
   isTitleText, type Entry, type Session, type Target, type Report } from "./model.ts";
-import { parseJsonl } from "./adapters.ts";
+import { canonicalMessage } from "./canonical.ts";
+import { load, parseJsonl } from "./adapters.ts";
 
 const uuidPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 async function exists(path: string) {
@@ -34,16 +35,22 @@ export async function discover(provider: "all" | "claude" | "codex" = "all") {
         if (str(entry.id) && str(entry.thread_name)) titles.set(String(entry.id), String(entry.thread_name)); }
       catch { /* The optional title index does not determine whether a session exists. */ }
     }
-    for await (const path of walk(root)) {
-      if (!path.endsWith(".jsonl")) continue;
-      const stem = basename(path, ".jsonl"), id = source === "claude" ? stem : stem.slice(-36);
+    for (const directory of source === "codex" ? [root, join(root, "..", "archived_sessions")] : [root]) for await (const path of walk(directory)) {
+      if (!path.endsWith(".jsonl") && !path.endsWith(".jsonl.zst")) continue;
+      const stem = basename(path.replace(/\.zst$/, ""), ".jsonl"), id = source === "claude" ? stem : stem.slice(-36);
       if (!uuidPattern.test(id)) continue;
       results.push({ id, source: source as Entry["source"], path, title: titles.get(id), modified: (await stat(path)).mtimeMs / 1000 });
     }
   }
-  return results.sort((a, b) => b.modified - a.modified);
+  const preferred = new Map<string, Entry>();
+  for (const entry of results) {
+    const key = `${entry.source}:${entry.id}`, prior = preferred.get(key);
+    if (!prior || prior.path.endsWith('.zst') && !entry.path.endsWith('.zst') || prior.path.endsWith('.zst') === entry.path.endsWith('.zst') && entry.modified > prior.modified) preferred.set(key, entry);
+  }
+  return [...preferred.values()].sort((a, b) => b.modified - a.modified);
 }
 export async function describe(e: Entry): Promise<Entry> {
+  if (e.path.endsWith(".jsonl.zst")) { const { session } = await load(e.path, undefined, "full", { children: false }); return { ...e, cwd: session.cwd, title: e.title ?? session.title }; }
   const file = await open(e.path, "r"), buffer = Buffer.alloc(256 * 1024);
   let data: string, tail: string;
   try {
@@ -68,6 +75,11 @@ export async function describe(e: Entry): Promise<Entry> {
     if (r.type === "ai-title") automaticTitle = str(r.aiTitle) ?? automaticTitle;
     if (r.type === "session_meta") cwd = str(row(r.payload).cwd);
     cwd ??= str(r.cwd);
+    if (e.source === 'codex' && r.type === 'event_msg' && title === 'Untitled conversation') {
+      const p = row(r.payload), canonical = canonicalMessage(r);
+      const value = canonical?.role === 'user' ? canonical.blocks.find(b => b.kind === 'text' && isTitleText(b.text))?.text : p.type === 'user_message' && str(p.message) && isTitleText(String(p.message)) ? String(p.message) : undefined;
+      if (value) title = value.slice(0, 100);
+    }
     const m = row(e.source === "claude" ? r.message : r.payload);
     if (["user", "response_item"].includes(String(r.type)) && m.role === "user" && !r.isMeta) {
       const b = contentBlocks(m.content).find(b => b.kind === "text" && isTitleText(b.text));
@@ -135,7 +147,7 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   }
   else session.workspace = undefined;
   const prepared = await prepareAssets(session, input.path, output); session = prepared.session;
-  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 3, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
+  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 4, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
     history: session.historyMode ?? "full", branch: session.selectedBranch, install: Boolean(options.install), workspaceCheck: options.workspaceCheck ?? "warn",
     assets: Object.fromEntries(Object.entries(prepared.artifacts).map(([name, bytes]) => [name, hash(bytes)])) })) : undefined;
   if (outputExists && options.idempotencyKey) {
@@ -177,9 +189,9 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
     "context.json": encode(session.context ?? []),
     "branches.json": encode({ selected: session.selectedBranch, branches: session.branches ?? [] }),
     "metadata.json": encode({ session: session.metadata, messages: session.messages.map(m => ({ id: m.id, timestamp: m.timestamp, metadata: m.metadata })) }),
-    ["source-original" + (extname(input.path) === ".jsonl" ? ".jsonl" : ".json")]: input.raw,
+    ["source-original" + (input.path.endsWith(".jsonl.zst") ? ".jsonl.zst" : extname(input.path) === ".jsonl" ? ".jsonl" : ".json")]: input.raw,
     "conversation.md": Buffer.from(markdown(session)) };
-  for (const [index, source] of (input.relatedSources ?? []).entries()) artifacts[`sources/${index}-${hash(source.raw)}${extname(source.path) === ".json" ? ".json" : ".jsonl"}`] = source.raw;
+  for (const [index, source] of (input.relatedSources ?? []).entries()) artifacts[`sources/${index}-${hash(source.raw)}${source.path.endsWith(".jsonl.zst") ? ".jsonl.zst" : extname(source.path) === ".json" ? ".json" : ".jsonl"}`] = source.raw;
   if (target === "claude" || target === "codex") Object.assign(artifacts, renderFamily(session, target, sessionId, cwd, stamp, children));
   result.sha256 = Object.fromEntries(Object.entries(artifacts).map(([name, data]) => [name, hash(data)]));
   // Create parents separately so the final output directory always has exclusive ownership.
@@ -283,7 +295,7 @@ export async function undo(bundle: string, dryRun = false) {
   return { removed: !dryRun, dryRun, path: expected, bundlePreserved: expand(bundle) };
 }
 export async function compressedCount(provider: "claude" | "codex") {
-  let count = 0; for await (const p of walk(roots()[provider])) if (p.endsWith(".jsonl.zst")) count++;
+  let count = 0; for (const directory of provider === "codex" ? [roots()[provider], join(roots()[provider], "..", "archived_sessions")] : [roots()[provider]]) for await (const p of walk(directory)) if (p.endsWith(".jsonl.zst")) count++;
   return count;
 }
 

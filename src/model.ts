@@ -89,7 +89,7 @@ export function report(s: Session, target: Target): Report {
   const messages = [...s.messages, ...(s.context ?? []).flatMap(c => c.messages ?? [])];
   for (const m of messages) for (const b of m.blocks) counts[b.kind] = (counts[b.kind] ?? 0) + 1;
   const mapped = mappedMessages(s), warnings = [...s.warnings];
-  if (counts.tool_call || counts.tool_result) warnings.push(target === "codex" ? "Tool calls/results appear as imported tool-history cards; source tools are not registered or replayed." : "Tool calls/results transfer as historical text; destination tools use their own schemas.");
+  if (counts.tool_call || counts.tool_result) warnings.push(["claude", "codex"].includes(target) ? "Tool calls/results appear as native imported history; source tools are not registered or replayed." : "Tool calls/results transfer as historical text; destination tools use their own schemas.");
   if (counts.reasoning) warnings.push(`${counts.reasoning} private reasoning blocks excluded from resumed context; original bytes stay archived.`);
   if (counts.media) warnings.push(`${counts.media} attachments: local/inline assets are bundled; unresolved references are reported explicitly.`);
   if (counts.unsupported) warnings.push(`${counts.unsupported} unrecognized content blocks transfer as labeled text.`);

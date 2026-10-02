@@ -1,3 +1,4 @@
+import type { Session, Row } from "../src/model.ts";
 import { test, expect } from "bun:test";
 import { mkdtemp, mkdir, rm, readFile, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -162,5 +163,82 @@ last:JSON.stringify(messages).includes('CSV export, preserving cents.'),private:
     const undo = Bun.spawn([process.execPath, cli, "undo", join(dir, "bundle"), "--json"], { env, stdout: "pipe", stderr: "pipe" });
     expect(await undo.exited).toBe(0);
     for (const path of [manifest.installedPath, ...manifest.subagents.map(c => c.installedPath)]) expect(await access(path).then(() => true, () => false)).toBe(false);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+}, 30_000);
+
+test('event-only Codex history becomes balanced native Claude tools and round-trips without mirrored duplicates', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'baton-events-'));
+  const env = { ...process.env, CLAUDE_CONFIG_DIR: join(dir, 'claude'), CODEX_HOME: join(dir, 'codex') };
+  const meta = { type: 'session_meta', payload: { id: 'cccccccc-0000-4000-8000-000000000001', cwd: dir } };
+  const event = (id: string, item: object, second: number, type = 'item_completed') => ({ timestamp: `2026-10-02T10:00:${String(second).padStart(2, '0')}Z`, type: 'event_msg', payload: { type, turn_id: 'turn', item: { id, ...item } } });
+  try {
+    const source = join(dir, 'events.jsonl');
+    const rows: Row[] = [meta,
+      event('u1', { type: 'UserMessage', content: [{ type: 'text', text: 'Repeat this request.' }] }, 1),
+      event('u2', { type: 'UserMessage', content: [{ type: 'text', text: 'Repeat this request.' }] }, 2),
+      event('tool', { type: 'DynamicToolCall', tool: 'lookup', arguments: { key: 'invoice' }, status: 'in_progress' }, 3, 'item_started'),
+      event('tool', { type: 'DynamicToolCall', tool: 'lookup', arguments: { key: 'invoice' }, status: 'completed', success: true, content_items: [{ type: 'inputText', text: 'Invoice found.' }, { type: 'inputImage', imageUrl: `data:image/png;base64,${imageData}` }] }, 4),
+      { timestamp: '2026-10-02T10:00:05Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'orphan', output: 'Orphan evidence.' } },
+      event('pending', { type: 'DynamicToolCall', tool: 'unfinished', arguments: {}, status: 'in_progress' }, 6, 'item_started'),
+      event('mcp', { type: 'McpToolCall', server: 'example.invalid', tool: 'lookup', arguments: { key: 'receipt' }, status: 'failed', result: { content: [{ type: 'text', text: 'MCP failure evidence.' }], isError: true } }, 7),
+      event('command', { type: 'CommandExecution', command: ['bun', 'test'], cwd: dir, status: 'failed', stdout: 'Command failure evidence.', exit_code: 1 }, 7),
+      event('patch', { type: 'FileChange', changes: { 'invoice.ts': { diff: '+amount_cents' } }, status: 'completed' }, 7),
+      event('thought', { type: 'Reasoning', content: ['private scratchpad'] }, 8),
+      event('answer', { type: 'AgentMessage', content: [{ type: 'Text', text: 'Continue CSV export.' }] }, 9),
+      { timestamp: '2026-10-02T10:00:09Z', type: 'event_msg', payload: { type: 'agent_message', message: 'Continue CSV export.' } }
+    ];
+    const invoke = async (args: string[]) => {
+      const proc = Bun.spawn([process.execPath, cli, ...args, '--json'], { env, stdout: 'pipe', stderr: 'pipe' });
+      const [stdout, stderr, exit] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
+      expect(exit).toBe(0); return JSON.parse(stdout || stderr);
+    };
+    await writeFile(source, rows.filter(r => r.type !== 'response_item').map(r => JSON.stringify(r)).join('\n') + '\n');
+    const pure = join(dir, 'pure'); await invoke(['convert', source, '--to', 'portable', '--out', pure]);
+    const pureSession = JSON.parse(await readFile(join(pure, 'session.json'), 'utf8')) as Session;
+    expect(pureSession.messages.flatMap(m => m.blocks).filter(b => b.text === 'Repeat this request.').length).toBe(2);
+    await writeFile(source, rows.map(r => JSON.stringify(r)).join('\n') + '\n');
+    const bundle = join(dir, 'claude-bundle');
+    const manifest = await invoke(['convert', source, '--to', 'claude', '--install', '--cwd', dir, '--out', bundle]);
+    const original = JSON.parse(await readFile(join(bundle, 'session.json'), 'utf8')) as Session;
+    expect(original.messages.filter(m => m.blocks.some(b => b.text === 'Repeat this request.')).length).toBe(2);
+    expect(original.messages.filter(m => m.blocks.some(b => b.text === 'Continue CSV export.')).length).toBe(1);
+    expect(original.messages.flatMap(m => m.blocks).filter(b => b.kind === 'tool_call').length).toBe(4);
+    expect(manifest.warnings.join(' ')).toContain('FileChange');
+    const check = `import {getSessionMessages} from '@anthropic-ai/claude-agent-sdk';
+const messages=await getSessionMessages(${JSON.stringify(manifest.sessionId)},{dir:${JSON.stringify(dir)}});
+console.log(JSON.stringify(messages.flatMap(m=>Array.isArray(m.message.content)?m.message.content:[])));`;
+    const sdk = Bun.spawn([process.execPath, '--eval', check], { env, cwd: fileURLToPath(new URL('..', import.meta.url)), stdout: 'pipe', stderr: 'pipe' });
+    const blocks = await new Response(sdk.stdout).json() as { type: string; id: string; tool_use_id: string; name: string; input: unknown; content: string; is_error?: boolean }[]; expect(await sdk.exited).toBe(0);
+    const calls = blocks.filter(b => b.type === 'tool_use'), results = blocks.filter(b => b.type === 'tool_result');
+    expect(calls.length).toBe(5); expect(results.length).toBe(5);
+    expect(calls.every(b => /^[a-zA-Z0-9_-]{1,128}$/.test(b.name))).toBe(true);
+    expect(new Set(calls.map(b => b.id))).toEqual(new Set(results.map(b => b.tool_use_id)));
+    expect(calls.find(b => b.name === 'lookup')!.input).toEqual({ key: 'invoice' });
+    expect(results.some(b => b.content.includes('Invoice found.'))).toBe(true);
+    expect(results.some(b => b.is_error && b.content === 'MCP failure evidence.')).toBe(true);
+    expect(results.some(b => b.is_error && b.content === 'Command failure evidence.')).toBe(true);
+    expect(blocks.some(b => b.type === 'image')).toBe(true);
+    expect(results.some(b => b.content === 'Orphan evidence.')).toBe(true);
+    expect(results.some(b => b.is_error && b.content.includes('imported inactive'))).toBe(true);
+    expect(JSON.stringify(blocks)).not.toContain('private scratchpad');
+    const inverse = join(dir, 'inverse');
+    await invoke(['convert', manifest.installedPath, '--to', 'portable', '--out', inverse]);
+    const roundtrip = JSON.parse(await readFile(join(inverse, 'session.json'), 'utf8')) as Session;
+    // Asset bytes and metadata survive; each bundle owns a fresh local path.
+    for (const m of roundtrip.messages) for (const b of m.blocks) if (b.kind === 'media' && b.asset?.path) {
+      expect((await readFile(b.asset.path)).equals(Buffer.from(imageData, 'base64'))).toBe(true);
+      b.asset.path = b.asset.path.replace(inverse, bundle); b.text = b.text.replace(inverse, bundle);
+    }
+    expect(roundtrip.messages).toEqual(original.messages);
+    // Mixed formats represent the same user/tool evidence only once.
+    const mixed = [...rows];
+    mixed.splice(1, 0, { timestamp: '2026-10-02T10:00:01Z', type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Repeat this request.' }] } });
+    mixed.push({ timestamp: '2026-10-02T10:00:03Z', type: 'response_item', payload: { type: 'function_call', call_id: 'tool', name: 'lookup', arguments: '{"key":"invoice"}' } }, { timestamp: '2026-10-02T10:00:04Z', type: 'response_item', payload: { type: 'function_call_output', call_id: 'tool', output: [{ type: 'input_text', text: 'Invoice found.' }, { type: 'input_image', image_url: `data:image/png;base64,${imageData}` }] } });
+    await writeFile(source, mixed.map(r => JSON.stringify(r)).join('\n') + '\n');
+    const mixedOut = join(dir, 'mixed'); await invoke(['convert', source, '--to', 'portable', '--out', mixedOut]);
+    const mixedSession = JSON.parse(await readFile(join(mixedOut, 'session.json'), 'utf8')) as Session;
+    expect(mixedSession.messages.flatMap(m => m.blocks).filter(b => b.kind === 'tool_call').length).toBe(4);
+    expect(mixedSession.messages.flatMap(m => m.blocks).filter(b => b.text === 'Repeat this request.').length).toBe(2);
+    expect(mixedSession.messages.flatMap(m => m.blocks).filter(b => b.kind === 'media').length).toBe(1);
   } finally { await rm(dir, { recursive: true, force: true }); }
 }, 30_000);
