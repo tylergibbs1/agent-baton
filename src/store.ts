@@ -147,7 +147,7 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   }
   else session.workspace = undefined;
   const prepared = await prepareAssets(session, input.path, output); session = prepared.session;
-  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 7, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
+  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 8, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
     history: session.historyMode ?? "full", branch: session.selectedBranch, install: Boolean(options.install), workspaceCheck: options.workspaceCheck ?? "warn",
     assets: Object.fromEntries(Object.entries(prepared.artifacts).map(([name, bytes]) => [name, hash(bytes)])) })) : undefined;
   if (outputExists && options.idempotencyKey) {

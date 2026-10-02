@@ -17,7 +17,7 @@ export function presentMessage(message: Message): { role: string; blocks: Block[
   }
   if (!(origin?.kind === 'human' || record?.turnOrigin === 'human' || record?.promptSource === 'typed')) return message;
   return { role: message.role, blocks: message.blocks.map(block => block.kind !== 'text' ? block : {
-    ...block, text: block.text.replace(/<pasted_content\s+id="[\w-]+">([\s\S]*?)<\/pasted_content>/g, (raw, body: string) => {
+    ...block, text: block.text.replace(/<pasted_content\s+id="([\w-]+)">([\s\S]*?)<\/pasted_content(?:\s+id="\1")?>/g, (raw, _id: string, body: string) => {
       if (body.includes('<pasted_content')) return raw;
       return `\n\n${body.trim().split('\n').map(line => `> ${line}`).join('\n')}\n\n`;
     }),
