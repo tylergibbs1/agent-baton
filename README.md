@@ -260,3 +260,5 @@ Codex response items, canonical desktop items, and legacy message events are rec
 Messages with no resumed content (including empty messages and reasoning-only records with their private text removed) retain their positions, IDs, timestamps, and metadata in bridge extensions. They add no visible destination messages.
 
 Generated transfer context, supplemental memory, and workspace checks remain available to the model without becoming visible chat messages. Codex stores this context as non-displayed response history, with no canonical user item; Claude marks the generated preamble as internal metadata. Native subagent links and actual source turns remain visible. Existing imports retain their previous display; convert again to create a fresh import with this layout.
+
+Claude peer messages are displayed as attributed historical assistant messages, rather than user instructions. Paired `pasted_content` wrappers in human messages become quoted sections. Original roles, wrappers, sender metadata, and text remain in the inverse bridge and source archive; malformed wrappers and literal peer XML in human messages are retained unchanged.

@@ -39,7 +39,15 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
   sourceRows.push({ type: "user", uuid: "notice-completed", parentUuid: "notice-failed", sessionId: sourceRows[0].sessionId, timestamp: "2026-10-02T18:01:00Z", origin: { kind: "task-notification" }, message: { role: "user", content: notification.replace("<status>failed</status>", "<status>completed</status>") } });
   sourceRows.push({ type: "user", uuid: "literal-xml", parentUuid: "notice-completed", sessionId: sourceRows[0].sessionId, message: { role: "user", content: notification } });
   sourceRows.push({ type: "user", uuid: "literal-tool-text", parentUuid: "literal-xml", sessionId: sourceRows[0].sessionId, message: { role: "user", content: "Please explain [Historical tool result: example] as text." } });
-  sourceRows.push({ type: "assistant", uuid: "unfinished-call", parentUuid: "literal-tool-text", sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "unfinished", name: "Read", input: { file_path: "missing-result.ts" } }] } });
+  const peerText = 'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/old.sock" from-name="Web worker" from-mode="bypass">\nSchema is ready.\n</cross-session-message>';
+  const pastedText = 'Please assess this.\n<pasted_content id="a2e9">First line.\n\n```ts\nconst n = 1;\n```</pasted_content>\nAfter paste.\n<pasted_content id="b2">Second paste.</pasted_content>';
+  for (const entry of [
+    { uuid: 'peer-message', isMeta: true, origin: { kind: 'peer', name: 'Web worker' }, content: peerText },
+    { uuid: 'literal-peer', origin: { kind: 'human' }, content: peerText },
+    { uuid: 'human-paste', origin: { kind: 'human' }, content: pastedText },
+    { uuid: 'broken-paste', origin: { kind: 'human' }, content: '<pasted_content id="broken">unfinished' },
+  ]) sourceRows.push({ type: 'user', parentUuid: sourceRows.at(-1).uuid, sessionId: sourceRows[0].sessionId, ...entry, message: { role: 'user', content: entry.content } });
+  sourceRows.push({ type: "assistant", uuid: "unfinished-call", parentUuid: "broken-paste", sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "unfinished", name: "Read", input: { file_path: "missing-result.ts" } }] } });
   await writeFile(source, sourceRows.map(r => JSON.stringify(r)).join("\n") + "\n");
   const exported = Bun.spawn([process.execPath, cli, "convert", source, "--to", "codex", "--install", "--cwd", dir, "--out", join(dir, "bundle"), "--idempotency-key", "native-family", "--json"], { env, stdout: "pipe", stderr: "pipe" });
   const m = await new Response(exported.stdout).json() as { sessionId: string; installedPath: string; subagents: { sessionId: string; installedPath: string }[] };
@@ -110,6 +118,16 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
     expect(JSON.stringify(taskEvents[0])).toContain("errored");
     expect(JSON.stringify(taskEvents[1])).toContain("Audit saved.");
     expect(parentItems.filter(item => item.type === "userMessage" && JSON.stringify(item).includes("<task-notification>"))).toHaveLength(1);
+    const visibleText = (type: string) => parentItems.filter(i => i.type === type).map(i => JSON.stringify(i)).join('\n');
+    expect(visibleText('agentMessage')).toContain('[Historical Claude peer message from Web worker]');
+    expect(visibleText('agentMessage')).toContain('Schema is ready.');
+    expect(visibleText('agentMessage')).not.toContain('<cross-session-message');
+    expect(parentItems.filter(i => i.type === 'userMessage' && JSON.stringify(i).includes('<cross-session-message'))).toHaveLength(1);
+    expect(visibleText('userMessage')).toContain('> First line.');
+    expect(visibleText('userMessage')).toContain('> Second paste.');
+    expect(visibleText('userMessage')).toContain('After paste.');
+    expect(visibleText('userMessage')).not.toContain('id=\\"a2e9');
+    expect(visibleText('userMessage')).toContain('<pasted_content id=\\"broken');
     const nested = await rpc("thread/read", { threadId: m.subagents[1].sessionId, includeTurns: true }) as { thread: { parentThreadId: string } };
     expect(nested.thread.parentThreadId).toBe(m.subagents[0].sessionId);
     expect(JSON.stringify(await rpc("thread/items/list", { threadId: m.subagents[1].sessionId, limit: 100 }))).toContain("Nested audit checked cents bounds.");
@@ -124,10 +142,15 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
     expect(family.subagents).toHaveLength(2);
     const restored = JSON.parse(await readFile(join(dir, "roundtrip", "session.json"), "utf8"));
     expect(restored.messages.find((message: { id: string }) => message.id === "notice-failed").blocks[0].text).toBe(notification);
+    expect(restored.messages.find((m: { id: string }) => m.id === 'peer-message').blocks[0].text).toBe(peerText);
+    expect(restored.messages.find((m: { id: string }) => m.id === 'peer-message').role).toBe('user');
+    expect(restored.messages.find((m: { id: string }) => m.id === 'human-paste').blocks[0].text).toBe(pastedText);
     const sdkUrl = new URL("../node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs", import.meta.url).href;
-    const check = Bun.spawn([process.execPath, "--eval", `import{listSubagents,getSubagentMessages}from ${JSON.stringify(sdkUrl)};const ids=await listSubagents(${JSON.stringify(family.sessionId)},{dir:${JSON.stringify(dir)}});console.log(JSON.stringify({ids,messages:await Promise.all(ids.map(id=>getSubagentMessages(${JSON.stringify(family.sessionId)},id,{dir:${JSON.stringify(dir)}})))}));`], { env, stdout: "pipe", stderr: "pipe" });
+    const check = Bun.spawn([process.execPath, "--eval", `import{listSubagents,getSubagentMessages,getSessionMessages}from ${JSON.stringify(sdkUrl)};const ids=await listSubagents(${JSON.stringify(family.sessionId)},{dir:${JSON.stringify(dir)}});console.log(JSON.stringify({history:await getSessionMessages(${JSON.stringify(family.sessionId)},{dir:${JSON.stringify(dir)}}),ids,messages:await Promise.all(ids.map(id=>getSubagentMessages(${JSON.stringify(family.sessionId)},id,{dir:${JSON.stringify(dir)}})))}));`], { env, stdout: "pipe", stderr: "pipe" });
     const cc = await new Response(check.stdout).json();
     expect(await check.exited).toBe(0);
+    expect(JSON.stringify(cc.history)).toContain('[Historical Claude peer message from Web worker]');
+    expect(JSON.stringify(cc.history)).toContain('> First line.');
     expect(cc.ids.sort()).toEqual(family.subagents.map(c => c.sessionId).sort());
     expect(JSON.stringify(cc.messages)).toContain("Child confirmed cents are integers.");
     await writeFile(join(dir, "media", "subagents", "agent-source-worker.meta.json"), JSON.stringify({ agentType: "general-purpose", description: "Changed child metadata" }));

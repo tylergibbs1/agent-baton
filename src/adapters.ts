@@ -335,7 +335,7 @@ export async function load(path: string, conversation?: string, history: "full" 
   return { session, raw, path, relatedSources, records };
 }
 export function native(s: Session, target: Target, id: string, cwd: string, timestamp: string, notificationAgents: Map<string, NotificationAgent> = new Map()): Row[] {
-  const mapped: ReturnType<typeof mappedMessages> = [{ role: "user", id: undefined, metadata: undefined, text: `Conversation transferred from ${s.source} by baton. Prior tool activity is historical, not pending actions. Continue from the last turn using this app's current tools and permissions. Workspace files are checked, not copied. Supplemental history follows.\n\n${continuityText(s)}`, timestamp, originalRole: "user", blocks: [] }, ...mappedMessages(s)];
+  const mapped: ReturnType<typeof mappedMessages> = [{ role: "user", id: undefined, metadata: undefined, text: `Conversation transferred from ${s.source} by baton. Prior tool activity is historical, not pending actions. Continue from the last turn using this app's current tools and permissions. Workspace files are checked, not copied. Supplemental history follows.\n\n${continuityText(s)}`, timestamp, originalRole: "user", blocks: [], displayBlocks: [] }, ...mappedMessages(s)];
   const sessionBridge = { version: 1, session: { source: s.source, sourceId: s.sourceId, metadata: s.metadata, title: s.title,
     omittedMessages: s.messages.flatMap((m, index) => renderBlocks(m.blocks) ? [] : [{ index, message: { ...m, blocks: m.blocks.map(b => b.kind === 'reasoning' ? { kind: b.kind, text: '', format: b.format } : b) } }]), branches: s.branches?.map(({ id, current }) => ({ id, current })), selectedBranch: s.selectedBranch, context: s.context?.map(c => ({ ...c, messages: c.messages?.map(m => ({ ...m, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) })) })), workspace: s.workspace } };
   const messageBridge = (m: (typeof mapped)[number]) => ({ version: 1, message: { id: m.id, timestamp: m.timestamp, metadata: m.metadata, role: m.originalRole, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) } });
@@ -369,7 +369,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
       }
       let role = m.role, content: Row[] = [], usedBridge = false;
       const flush = () => { if (!content.length) return; append(role, content, m, usedBridge ? generated : bridge); usedBridge = true; content = []; };
-      for (const b of m.blocks) {
+      for (const b of m.displayBlocks) {
         if (b.kind === 'reasoning') continue;
         const nextRole = b.kind === 'tool_call' ? 'assistant' : b.kind === 'tool_result' || b.kind === 'media' ? 'user' : m.role;
         if (role !== nextRole) { flush(); role = nextRole; }
@@ -427,7 +427,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
     }
     const notification = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
     const hasTools = m.blocks.some(b => b.kind === "tool_call" || b.kind === "tool_result");
-    const chatBlocks = m.blocks.filter(b => b.kind !== "tool_call" && b.kind !== "tool_result");
+    const chatBlocks = m.displayBlocks.filter(b => b.kind !== "tool_call" && b.kind !== "tool_result");
     const chatText = hasTools ? renderBlocks(chatBlocks) : m.text;
     if ((!notification && m.role === "user" && (!hasTools || chatText)) || !turnId) {
       finish(); turnId = randomUUID(); lastAnswer = null; turnStart = stamp;
@@ -454,7 +454,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
       if (chatText) event({ type: "item_completed", thread_id: id, turn_id: turnId, completed_at_ms: Date.parse(stamp), item: m.role === "user"
         ? { type: "UserMessage", id: mid, content: [{ type: "text", text: chatText, text_elements: [] }, ...nativeMedia(chatBlocks, "codex").map(b => ({ type: "image", image_url: b.image_url }))] }
         : { type: "AgentMessage", id: mid, content: [{ type: "Text", text: chatText }], phase, memory_citation: null } }, stamp);
-      for (const b of m.blocks) {
+      for (const b of m.displayBlocks) {
         if (b.kind === "tool_call") {
           const callId = b.callId ?? randomUUID(), previous = toolCalls.get(callId);
           if (previous) emitTool(previous, "Source call ID was reused without a recorded result; imported inactive.", true, stamp);

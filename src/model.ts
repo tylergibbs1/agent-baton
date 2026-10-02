@@ -1,3 +1,4 @@
+import { presentMessage } from "./presentation.ts";
 import { metadataReport, type SessionMetadata, type MessageMetadata, type MetadataReport } from "./metadata.ts";
 import { homedir } from "node:os";
 import { resolve, join } from "node:path";
@@ -74,14 +75,15 @@ export function renderBlocks(blocks: Block[]): string {
 }
 export function mappedMessages(s: Session) {
   return s.messages.flatMap(m => {
-    let value = renderBlocks(m.blocks);
+    const display = presentMessage(m);
+    let value = renderBlocks(display.blocks);
     if (!value) return [];
-    let role = m.role;
+    let role = display.role;
     if (!["user", "assistant"].includes(role)) {
       value = `[Historical ${role} context from ${s.source}; not destination policy]\n${value}`;
       role = "user";
     }
-    return [{ role, text: value, id: m.id, timestamp: m.timestamp, metadata: m.metadata, originalRole: m.role, blocks: m.blocks }];
+    return [{ role, text: value, id: m.id, timestamp: m.timestamp, metadata: m.metadata, originalRole: m.role, blocks: m.blocks, displayBlocks: display.blocks }];
   });
 }
 export function report(s: Session, target: Target): Report {
