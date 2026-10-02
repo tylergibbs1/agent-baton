@@ -1,11 +1,13 @@
+import { readBytes } from "./io.ts";
+import { planChildren, renderFamily, claudeChildPath, type NativeChild } from "./subagents.ts";
 import { checkWorkspace, prepareAssets } from "./continuity.ts";
-import { codexStorage } from "./codex-client.ts";
-import { readdir, stat, open, readFile, mkdir, rm, lstat, realpath, rename } from "node:fs/promises";
+import { codexStorage, codexStorageSession } from "./codex-client.ts";
+import { readdir, stat, open, mkdir, rm, lstat, realpath, rename } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { BridgeError, expand, roots, row, str, contentBlocks, report, hash, markdown,
   isTitleText, type Entry, type Session, type Target, type Report } from "./model.ts";
-import { native, parseJsonl } from "./adapters.ts";
+import { parseJsonl } from "./adapters.ts";
 
 const uuidPattern = /^[\da-f]{8}-[\da-f]{4}-[\da-f]{4}-[\da-f]{4}-[\da-f]{12}$/i;
 async function exists(path: string) {
@@ -28,7 +30,7 @@ export async function discover(provider: "all" | "claude" | "codex" = "all") {
     if (provider !== "all" && provider !== source) continue;
     const titles = new Map<string, string>();
     if (source === "codex") {
-      try { for (const entry of parseJsonl(await readFile(join(root, "..", "session_index.jsonl"), "utf8")))
+      try { for (const entry of parseJsonl(await Bun.file(join(root, "..", "session_index.jsonl")).text()))
         if (str(entry.id) && str(entry.thread_name)) titles.set(String(entry.id), String(entry.thread_name)); }
       catch { /* The optional title index does not determine whether a session exists. */ }
     }
@@ -107,13 +109,14 @@ const encode = (v: unknown) => Buffer.from(JSON.stringify(v, null, 2) + "\n");
 const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
 export interface Manifest extends Report {
   format: "session-bridge-manifest/v1"; dryRun: boolean; sessionId: string; output: string;
-  installedPath?: string; resumeCommand?: string; resumeArgv?: string[]; nextStep?: string;
+  subagents?: NativeChild[]; installedPath?: string; resumeCommand?: string; resumeArgv?: string[]; nextStep?: string;
   idempotencyKey?: string; requestSha256?: string; reused?: boolean; installedSessionChanged?: boolean; completed?: boolean; nativeMetadataRegistered?: boolean; sha256?: Record<string, string>; createdAt: string;
 }
 export interface ConvertOptions { idempotencyKey?: string; out?: string; cwd?: string; install?: boolean; dryRun?: boolean; workspaceCheck?: "warn" | "strict" | "off" }
 export async function convert(input: { session: Session; raw: Uint8Array; path: string; relatedSources?: { path: string; raw: Uint8Array }[] }, target: Target, options: ConvertOptions = {}): Promise<Manifest> {
   if (options.idempotencyKey && (!options.out || !/^[A-Za-z0-9._-]{1,128}$/.test(options.idempotencyKey))) throw new BridgeError("INVALID_ARGUMENT", "Idempotency requires a valid key and explicit --out.");
   if (options.install && !["claude", "codex"].includes(target)) throw new BridgeError("UNSUPPORTED_INSTALL", "Only Claude and Codex support native local installation.");
+  if (options.install && !options.dryRun && target === "codex" && !Bun.which("codex")) throw new BridgeError("CODEX_NOT_INSTALLED", "Codex CLI is required to initialize native imports.");
   let cwd = expand(options.cwd ?? input.session.cwd ?? process.cwd());
   if (await exists(cwd) && (await stat(cwd)).isDirectory()) cwd = await realpath(cwd);
   let session: Session = { ...input.session, cwd,
@@ -132,7 +135,7 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   }
   else session.workspace = undefined;
   const prepared = await prepareAssets(session, input.path, output); session = prepared.session;
-  const requestSha256 = options.idempotencyKey ? hash(encode({ source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
+  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 2, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
     history: session.historyMode ?? "full", branch: session.selectedBranch, install: Boolean(options.install), workspaceCheck: options.workspaceCheck ?? "warn",
     assets: Object.fromEntries(Object.entries(prepared.artifacts).map(([name, bytes]) => [name, hash(bytes)])) })) : undefined;
   if (outputExists && options.idempotencyKey) {
@@ -146,7 +149,14 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
       if (!uuidPattern.test(previous.sessionId) || typeof previous.cwd !== "string" || typeof previous.createdAt !== "string" || previous.installedPath !== destination(target as "claude" | "codex", previous.sessionId, previous.cwd, previous.createdAt)) throw new BridgeError("INVALID_MANIFEST", "Idempotent receipt contains an invalid installed path.");
       if (!await exists(previous.installedPath)) throw new BridgeError("INSTALLED_SESSION_MISSING", "The previous imported session was removed.", "Create a new conversion with a new key and output.");
       if ((await lstat(previous.installedPath)).isSymbolicLink()) throw new BridgeError("INVALID_MANIFEST", "Installed session is a symbolic link.");
-      installedSessionChanged = hash(await readFile(previous.installedPath)) !== previous.sha256?.[`${target}.jsonl`];
+      installedSessionChanged = hash(await readBytes(previous.installedPath)) !== previous.sha256?.[`${target}.jsonl`];
+    }
+    for (const child of previous.subagents ?? []) {
+      for (const file of childFilesForReceipt(previous, child)) {
+        if (!await exists(file.path)) throw new BridgeError("INSTALLED_SESSION_MISSING", "An imported child session was removed.");
+        if ((await lstat(file.path)).isSymbolicLink()) throw new BridgeError("INVALID_MANIFEST", "Installed child is a symbolic link.");
+        installedSessionChanged ||= hash(await readBytes(file.path)) !== previous.sha256?.[file.artifact];
+      }
     }
     return { ...previous, reused: true, dryRun: Boolean(options.dryRun), installedSessionChanged };
   }
@@ -155,8 +165,10 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   const installedPath = options.install ? destination(target as "claude" | "codex", sessionId, cwd, stamp) : undefined;
   const resumeArgv = installedPath ? target === "claude" ? ["claude", "--resume", sessionId] : ["codex", "resume", sessionId, "-C", cwd] : undefined;
   const resumeCommand = resumeArgv ? (target === "claude" ? `cd ${quote(cwd)} && ` : "") + resumeArgv.map(quote).join(" ") : undefined;
+  const children = target === "claude" || target === "codex" ? planChildren(session, target, sessionId) : [];
+  if (installedPath) for (const child of children) child.installedPath = target === "claude" ? claudeChildPath(installedPath, sessionId, child.sessionId) : destination("codex", child.sessionId, cwd, stamp);
   const result: Manifest = { ...preview, format: "session-bridge-manifest/v1", dryRun: Boolean(options.dryRun), sessionId, output,
-    installedPath, resumeArgv, resumeCommand, createdAt: stamp, completed: false, ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey, requestSha256 } : {}),
+    subagents: children, installedPath, resumeArgv, resumeCommand, createdAt: stamp, completed: false, ...(options.idempotencyKey ? { idempotencyKey: options.idempotencyKey, requestSha256 } : {}),
     nextStep: target === "chatgpt" ? "Upload conversation.md to a new ChatGPT chat and ask it to continue from the final turn."
       : !options.install && ["claude", "codex"].includes(target) ? "Repeat the conversion with --install to create a resumable local session." : undefined };
   if (options.dryRun) return result;
@@ -167,30 +179,56 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
     "metadata.json": encode({ session: session.metadata, messages: session.messages.map(m => ({ id: m.id, timestamp: m.timestamp, metadata: m.metadata })) }),
     ["source-original" + (extname(input.path) === ".jsonl" ? ".jsonl" : ".json")]: input.raw,
     "conversation.md": Buffer.from(markdown(session)) };
-  for (const [index, source] of (input.relatedSources ?? []).entries()) artifacts[`sources/${index}-${hash(source.raw)}.jsonl`] = source.raw;
-  if (target === "claude" || target === "codex") artifacts[`${target}.jsonl`] = Buffer.from(native(session, target, sessionId, cwd, stamp).map(r => JSON.stringify(r)).join("\n") + "\n");
+  for (const [index, source] of (input.relatedSources ?? []).entries()) artifacts[`sources/${index}-${hash(source.raw)}${extname(source.path) === ".json" ? ".json" : ".jsonl"}`] = source.raw;
+  if (target === "claude" || target === "codex") Object.assign(artifacts, renderFamily(session, target, sessionId, cwd, stamp, children));
   result.sha256 = Object.fromEntries(Object.entries(artifacts).map(([name, data]) => [name, hash(data)]));
   // Create parents separately so the final output directory always has exclusive ownership.
   const parent = join(output, ".."); await mkdir(parent, { recursive: true, mode: 0o700 });
   try { await mkdir(output, { mode: 0o700 }); }
   catch (e) { if (options.idempotencyKey && (e as NodeJS.ErrnoException).code === "EEXIST") throw new BridgeError("CONVERSION_IN_PROGRESS", "Another conversion claimed this output directory.", "Retry the same key after it completes."); throw e; }
   let installed = false;
+  const installedChildren: NativeChild[] = [];
   try {
     for (const [name, data] of Object.entries(artifacts)) { await mkdir(join(output, name, ".."), { recursive: true, mode: 0o700 }); await privateWrite(join(output, name), data); }
     await writeReceipt(output, result);
     if (installedPath) {
       await mkdir(join(installedPath, ".."), { recursive: true, mode: 0o700 });
-      await privateWrite(installedPath, artifacts[`${target}.jsonl`]); installed = true;
+      const installFamily = async (storage: typeof codexStorage) => {
+        for (const child of children) {
+          for (const file of childFilesForReceipt(result, child)) {
+            await mkdir(join(file.path, ".."), { recursive: true, mode: 0o700 });
+            await privateWrite(file.path, artifacts[file.artifact]);
+            if (!installedChildren.includes(child)) installedChildren.push(child);
+          }
+          if (target === "codex") {
+            await storage("thread/resume", { threadId: child.sessionId, path: child.installedPath!, cwd, excludeTurns: true });
+            await captureHydrated(result, child.artifact, child.installedPath!, artifacts[child.artifact]);
+            await storage("thread/name/set", { threadId: child.sessionId, name: child.title }); child.nativeMetadataRegistered = true;
+          }
+        }
+        await privateWrite(installedPath, artifacts[`${target}.jsonl`]); installed = true;
+        if (target === "codex") {
+          await storage("thread/resume", { threadId: sessionId, path: installedPath, cwd, excludeTurns: true });
+          await captureHydrated(result, `${target}.jsonl`, installedPath, artifacts[`${target}.jsonl`]);
+          try { await storage("thread/name/set", { threadId: sessionId, name: session.title }); result.nativeMetadataRegistered = true; }
+          catch (e) { result.nativeMetadataRegistered = false; result.metadata.native = result.metadata.native.filter(field => !field.startsWith("conversation title")); result.warnings.push(`Codex title registration failed; title remains preserved in the bundle: ${(e as Error).message}`); }
+        }
+      };
       if (target === "codex") {
-        try { await codexStorage("thread/name/set", { threadId: sessionId, name: session.title }); result.nativeMetadataRegistered = true; }
-        catch (e) { result.nativeMetadataRegistered = false; result.metadata.native = result.metadata.native.filter(field => !field.startsWith("conversation title")); result.warnings.push(`Codex title registration failed; title remains preserved in the bundle: ${(e as Error).message}`); }
-      }
+        await codexStorageSession(installFamily);
+        for (const child of children) await captureHydrated(result, child.artifact, child.installedPath!, artifacts[child.artifact]);
+        await captureHydrated(result, `${target}.jsonl`, installedPath, artifacts[`${target}.jsonl`]);
+      } else await installFamily(codexStorage);
     }
     result.completed = true;
     await writeReceipt(output, result);
   } catch (e) {
-    if (installed && installedPath && await exists(installedPath) && hash(await readFile(installedPath)) === result.sha256?.[`${target}.jsonl`]) {
-      if (result.nativeMetadataRegistered) {
+    try {
+      for (const child of [...installedChildren].reverse()) await removeChild(result, child);
+    } catch { throw new BridgeError("CLEANUP_FAILED", "Conversion failed; an owned child session could not be cleaned up.", `Preserved recovery bundle: ${output}`); }
+    if (installed && installedPath && await exists(installedPath)) {
+      if ((await lstat(installedPath)).isSymbolicLink() || hash(await readBytes(installedPath)) !== result.sha256?.[`${target}.jsonl`]) throw new BridgeError("CLEANUP_FAILED", "Conversion failed; its parent session changed during native initialization.", `Preserved recovery bundle: ${output}`);
+      if (target === "codex") {
         try { await codexStorage("thread/delete", { threadId: sessionId }); }
         catch { throw new BridgeError("CLEANUP_FAILED", `Conversion failed; its owned session could not be cleaned up: ${installedPath}`, `Preserved recovery bundle: ${output}`); }
       } else await rm(installedPath);
@@ -200,10 +238,10 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   return result;
 }
 function validArtifact(name: string) {
-  return /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || /^(assets|sources)\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name);
+  return /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name) || /^(assets|sources|children)\/[a-zA-Z0-9][a-zA-Z0-9._-]*$/.test(name);
 }
 async function readManifest(bundle: string): Promise<Manifest> {
-  const value: unknown = JSON.parse(await readFile(join(expand(bundle), "manifest.json"), "utf8")), m = row(value);
+  const value: unknown = JSON.parse(await Bun.file(join(expand(bundle), "manifest.json")).text()), m = row(value);
   if (m.format !== "session-bridge-manifest/v1" || !Object.keys(row(m.sha256)).length) throw new BridgeError("INVALID_MANIFEST", "Not a baton bundle manifest.");
   for (const [name, digest] of Object.entries(row(m.sha256))) {
     if (!validArtifact(name) || !/^[a-f\d]{64}$/.test(String(digest))) throw new BridgeError("INVALID_MANIFEST", "Invalid artifact name or checksum.");
@@ -214,7 +252,7 @@ export async function verify(bundle: string) {
   bundle = expand(bundle); const m = await readManifest(bundle), checks: Record<string, boolean> = {};
   for (const [name, expected] of Object.entries(m.sha256!)) {
     const path = join(bundle, name);
-    checks[name] = await exists(path) && !(await lstat(path)).isSymbolicLink() && (!name.includes("/") || !(await lstat(join(bundle, name.split("/")[0]))).isSymbolicLink()) && hash(await readFile(path)) === expected;
+    checks[name] = await exists(path) && !(await lstat(path)).isSymbolicLink() && (!name.includes("/") || !(await lstat(join(bundle, name.split("/")[0]))).isSymbolicLink()) && hash(await readBytes(path)) === expected;
   }
   return { ok: Object.values(checks).every(Boolean), checks, bundle };
 }
@@ -224,16 +262,59 @@ export async function undo(bundle: string, dryRun = false) {
   if (!uuidPattern.test(m.sessionId) || typeof m.cwd !== "string" || typeof m.createdAt !== "string") throw new BridgeError("INVALID_MANIFEST", "Invalid installed-session metadata.");
   const expected = destination(m.target as "claude" | "codex", m.sessionId, m.cwd, m.createdAt);
   if (m.installedPath !== expected) throw new BridgeError("INVALID_MANIFEST", "Installed path differs from the expected session location.");
-  if (!await exists(expected)) return { removed: false, reason: "Already absent", path: expected };
-  if ((await lstat(expected)).isSymbolicLink()) throw new BridgeError("INVALID_MANIFEST", "Installed session is a symbolic link.");
-  if (hash(await readFile(expected)) !== m.sha256![`${m.target}.jsonl`]) throw new BridgeError("SESSION_CHANGED", "Imported session has changed since installation.", "It may have been resumed. Remove it using the destination app if no longer needed.");
-  if (!dryRun) {
-    if (m.target === "codex" && m.nativeMetadataRegistered) await codexStorage("thread/delete", { threadId: m.sessionId });
-    else await rm(expected);
+  const owned = [{ path: expected, artifact: `${m.target}.jsonl` }, ...(m.subagents ?? []).flatMap(c => childFilesForReceipt(m, c))];
+  for (const file of owned) {
+    if (!await exists(file.path)) continue;
+    if ((await lstat(file.path)).isSymbolicLink()) throw new BridgeError("INVALID_MANIFEST", "Installed session is a symbolic link.");
+    if (hash(await readBytes(file.path)) !== m.sha256![file.artifact]) throw new BridgeError("SESSION_CHANGED", "Imported session or child has changed since installation.", "It may have been resumed. Remove it using the destination app if no longer needed.");
   }
+  if (!dryRun) {
+    const removeFamily = async (storage: typeof codexStorage) => {
+      for (const child of [...(m.subagents ?? [])].reverse()) await removeChild(m, child, storage);
+      if (await exists(expected)) {
+        if (m.target === "codex") await storage("thread/delete", { threadId: m.sessionId });
+        else await rm(expected);
+      }
+    };
+    if (m.target === "codex") await codexStorageSession(removeFamily);
+    else await removeFamily(codexStorage);
+  }
+
   return { removed: !dryRun, dryRun, path: expected, bundlePreserved: expand(bundle) };
 }
 export async function compressedCount(provider: "claude" | "codex") {
   let count = 0; for await (const p of walk(roots()[provider])) if (p.endsWith(".jsonl.zst")) count++;
   return count;
+}
+
+function childFilesForReceipt(m: Manifest, child: NativeChild): { path: string; artifact: string }[] {
+  if (!m.installedPath || !child.installedPath) return [];
+  if (!m.cwd || !/^(?:[a-f0-9]{16}|[a-f0-9-]{36})$/.test(child.sessionId) || !/^children\/\d+\.jsonl$/.test(child.artifact)) throw new BridgeError("INVALID_MANIFEST", "Invalid installed child identity.");
+  const expected = m.target === "claude" ? claudeChildPath(m.installedPath, m.sessionId, child.sessionId) : destination("codex", child.sessionId, m.cwd, m.createdAt);
+  if (child.installedPath !== expected) throw new BridgeError("INVALID_MANIFEST", "Child path differs from expected native location.");
+  const files = [{ path: expected, artifact: child.artifact }];
+  if (m.target === "claude") {
+    if (child.metadataArtifact !== child.artifact.replace(/\.jsonl$/, ".meta.json")) throw new BridgeError("INVALID_MANIFEST", "Invalid child metadata artifact.");
+    files.push({ path: expected.replace(/\.jsonl$/, ".meta.json"), artifact: child.metadataArtifact });
+  }
+  return files;
+}
+async function removeChild(m: Manifest, child: NativeChild, storage = codexStorage) {
+  for (const file of childFilesForReceipt(m, child)) {
+    if (!await exists(file.path)) continue;
+    if ((await lstat(file.path)).isSymbolicLink() || hash(await readBytes(file.path)) !== m.sha256?.[file.artifact]) throw new BridgeError("SESSION_CHANGED", "Imported child changed; cleanup refused.");
+    if (m.target === "codex") await storage("thread/delete", { threadId: child.sessionId });
+    else await rm(file.path);
+  }
+}
+
+async function captureHydrated(m: Manifest, artifact: string, path: string, original: Uint8Array) {
+  if ((await lstat(path)).isSymbolicLink()) throw new BridgeError("SESSION_CHANGED", "Native hydration produced an unexpected session path.");
+  const bytes = await readBytes(path);
+  if (!bytes.subarray(0, original.length).equals(Buffer.from(original))) throw new BridgeError("SESSION_CHANGED", "Native hydration rewrote imported history; preserving recovery files.");
+  if (hash(bytes) === m.sha256?.[artifact]) return;
+  const temporary = join(m.output, `.hydrated-${randomUUID()}.tmp`);
+  try { await privateWrite(temporary, bytes); await rename(temporary, join(m.output, artifact)); }
+  finally { await rm(temporary, { force: true }); }
+  m.sha256![artifact] = hash(bytes);
 }

@@ -2,7 +2,7 @@
 
 Pass the conversation. Keep the context.
 
-Continue a conversation in another coding agent when you hit a usage limit. A local TypeScript CLI running on Bun, with no runtime dependencies or model/cloud API calls. Native Codex title registration uses the installed local app-server.
+Continue a conversation in another coding agent when you hit a usage limit. A local TypeScript CLI running on Bun, with no runtime dependencies or model API calls. Native Codex hydration and title registration use the installed local app-server; no model turn is started.
 
 Claude Code ↔ Codex CLI use native resumable transcripts. Local Codex Desktop conversations are accepted as input. ChatGPT uses its `conversations.json` export as input and a Markdown handoff as output.
 
@@ -30,7 +30,7 @@ The last command prints a ready-to-run `codex resume ID -C PROJECT` command. For
 ./dist/baton convert codex:latest --to claude --install
 ```
 
-Use a full session ID, a unique prefix of at least six characters, or a transcript path when you want a specific conversation. `latest` means the most recently modified local transcript for that provider, including potentially active sessions. `list` excludes Claude subagent transcripts; explicit paths can convert one independently. Parent conversion automatically gathers Claude child transcripts and Codex child rollouts identified by recorded agent IDs; findings are included as historical supplemental context.
+Use a full session ID, a unique prefix of at least six characters, or a transcript path when you want a specific conversation. `latest` means the most recently modified local transcript for that provider, including potentially active sessions. `list` excludes Claude subagent transcripts; explicit paths can convert one independently. Parent conversion automatically gathers Claude child transcripts and Codex child rollouts identified by recorded agent IDs; children are exported as separate native subagent transcripts with fresh IDs and remapped parent relationships.
 
 ## Run from source
 
@@ -120,11 +120,11 @@ Claude streamed/repeated message usage is deduplicated by response identity. Cod
 
 `inspect --json` and the conversion manifest expose `metadata.native`, `metadata.preserved`, `metadata.fresh`, and explanatory notes. Missing/unsupported fields are preserved rather than guessed. Conversation text, attachments, and file contents are handled separately; the unchanged original source archive is the complete fallback.
 
-Native Codex registration does not start or resume a model turn. It uses the installed app-server's local storage API and target account configuration; the converter does not inspect credential files or copy credentials into active destination settings. Metadata may contain sensitive source identifiers, so its files use the same private modes as the conversation bundle.
+Native Codex registration hydrates stored sessions with `thread/resume` and registers titles without starting a model turn. Hydration populates the native history index; destination-added initialization records are included in the bundle checksums. It uses the installed app-server's local storage API and target account configuration; the converter does not inspect credential files or copy credentials into active destination settings. Metadata may contain sensitive source identifiers, so its files use the same private modes as the conversation bundle.
 
 ## Context continuity (0.3)
 
-Subagent conversations are attached as historical context ahead of the main conversation, so the final main turn remains the continuation point. Claude child discovery uses the parent's `SESSION_ID/subagents/` directory. Codex child discovery uses recorded spawn results and collaboration receiver IDs. Original child bytes are archived under `sources/`; structured child messages remain in `context.json` and native bridge extensions. Missing, unreadable, and capped discovery is reported. Discovery follows at most 128 transcripts.
+Native Claude/Codex conversions create separate child transcripts and remap parent IDs, nesting depth, names, and supported roles. Codex imports include native subagent-call items in the parent transcript and paginated child history. Claude imports use the native `SESSION_ID/subagents/agent-ID.jsonl` layout, metadata sidecars, and completed historical Agent links. The parent retains each child’s last assistant response and a link to its full transcript, while its final main turn remains the continuation point. Imported agents are historical; conversion never starts their work. Claude task notifications with source system provenance become native Codex agent events when their child or spawn ID resolves, preserving chronological failed/completed outcomes and results. Other recognized task notices become readable historical notices. User-authored XML remains user text. Complete notification XML, worktree details, and unknown fields survive in bridge metadata and the archive; in-progress source work is imported paused. Provider-specific roles are preserved in the archive and mapped to supported destination roles. Claude child discovery uses the parent's `SESSION_ID/subagents/` directory. Codex child discovery uses recorded spawn results and collaboration receiver IDs. Original child transcripts and Claude metadata sidecars are archived under `sources/`; structured child messages remain in `context.json`; native child files retain message provenance in bridge extensions. `manifest.json` exposes `subagents` with source IDs, fresh destination IDs, parent IDs, depth, artifact paths, and installed paths. Portable and ChatGPT targets retain supplemental context. Missing, unreadable, and capped discovery is reported. Discovery follows at most 128 transcripts.
 
 Claude recorded memory, session context, instructions, plans, relevant hook summaries, and edited-file snippets transfer as labeled source history. Codex's latest retained compaction context, verified answers, and readable inter-agent communications transfer alongside the selected main history. Encrypted communications and private reasoning are not restored as active context. Current destination instructions and permissions still apply.
 
@@ -160,11 +160,12 @@ bridge-exports/NEW_UUID/
   branches.json          # branch inventory and selected node
   workspace.json         # Git/dirty-file/reference checks and source comparison
   assets/                # local and inline attachment bytes
-  sources/               # original discovered child transcript bytes
+  sources/               # original child transcript/metadata bytes
+  children/              # separate native child transcripts and Claude sidecars
   codex.jsonl            # native target, or claude.jsonl
 ```
 
-Bundles have mode `0700`; files have mode `0600`. Conversion creates a fresh UUID and never modifies the source session. Installation uses an exclusive create. Codex titles are registered through local `thread/name/set` storage RPC; failures are reported while the title remains archived. `undo` refuses sessions modified after installation. Registered Codex imports are removed through local `thread/delete` so their native title/index metadata is removed too.
+Bundles have mode `0700`; files have mode `0600`. Conversion creates a fresh UUID and never modifies the source session. Installation uses an exclusive create. Codex titles are registered through local `thread/name/set` storage RPC; failures are reported while the title remains archived. `undo` preflights the parent and every child, refusing the whole operation if any transcript or sidecar changed after installation. Matching idempotent retries reuse the same child IDs and check all installed family members. Registered Codex imports are removed through local `thread/delete` so their native title/index metadata is removed too.
 
 ## Agent use (0.4)
 
@@ -225,6 +226,8 @@ bun run test:native
 Both test suites require the installed Codex CLI for local storage checks. Native tests also use the development-only Claude Agent SDK installed by `bun install`. They load imports through the real readers without starting a model turn. See `VALIDATION.md` for verification on this machine.
 
 Tested with Bun 1.4.2, Claude Code 2.1.287, Claude Agent SDK 0.3.287, and Codex CLI 0.159.2. Native transcript formats are internal and may change. Compressed Codex `.jsonl.zst` rollouts are currently unsupported: decompress a copy first. Inputs are limited to 512 MiB and malformed JSONL is rejected rather than silently skipped.
+
+Bun native file reads and SHA-256 hashing handle transcript and artifact data. JSONL parsing scans lines without building an intermediate line array. Exclusive creation, private file modes, fsync, and atomic renames protect the write transaction.
 
 The runtime separates typed normalization (`model.ts`), metadata preservation (`metadata.ts`), provider adapters (`adapters.ts`), attachment/workspace continuity (`continuity.ts`), session storage (`store.ts`), local Codex storage RPC (`codex-client.ts`), and command handling (`cli.ts`), shared CLI contracts (`contracts.ts`), and bounded agent I/O (`agent-io.ts`). Runtime documentation consulted: [Bun](https://bun.sh/docs), [Codex](https://github.com/openai/codex), and [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview).
 

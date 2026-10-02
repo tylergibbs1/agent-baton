@@ -1,5 +1,4 @@
 import { metadataReport, type SessionMetadata, type MessageMetadata, type MetadataReport } from "./metadata.ts";
-import { createHash } from "node:crypto";
 import { homedir } from "node:os";
 import { resolve, join } from "node:path";
 
@@ -8,7 +7,7 @@ export type Target = Provider | "portable";
 export type BlockKind = "text" | "tool_call" | "tool_result" | "reasoning" | "media" | "summary" | "unsupported";
 export interface Asset { mime?: string; data?: string; path?: string; url?: string; pointer?: string; bundlePath?: string; sha256?: string; status?: "copied" | "missing" | "remote" | "unresolved" }
 export interface Branch { id: string; current: boolean; title?: string }
-export interface Context { kind: "subagent" | "memory" | "retained" | "communication"; label: string; text?: string; messages?: Message[]; sourcePath?: string; sourceId?: string }
+export interface Context { kind: "subagent" | "memory" | "retained" | "communication"; label: string; text?: string; messages?: Message[]; sourcePath?: string; sourceId?: string; parentSourceId?: string; agentRole?: string; agentNickname?: string; spawnCallId?: string; metadata?: SessionMetadata }
 export interface Workspace { source?: { cwd: string; git?: Workspace["git"] }; cwd: string; exists: boolean; git?: { root?: string; branch?: string; commit?: string; dirty: { path: string; sha256?: string; status: string }[] }; referenced: { path: string; exists: boolean }[]; mismatches: string[] }
 export interface Block { kind: BlockKind; text: string; name?: string; callId?: string; format?: string; isError?: boolean; asset?: Asset }
 export interface Message { role: string; blocks: Block[]; timestamp?: string | number | null; id?: string; metadata?: MessageMetadata }
@@ -29,7 +28,7 @@ export const row = (v: unknown): Row => v !== null && typeof v === "object" && !
 export const arr = (v: unknown): unknown[] => Array.isArray(v) ? v : [];
 export const str = (v: unknown): string | undefined => typeof v === "string" ? v : undefined;
 export const text = (v: unknown): string => typeof v === "string" ? v : JSON.stringify(v) ?? "";
-export const hash = (data: string | Uint8Array) => createHash("sha256").update(data).digest("hex");
+export const hash = (data: string | Uint8Array) => new Bun.CryptoHasher("sha256").update(data).digest("hex");
 export const unique = (items: string[]) => [...new Set(items)];
 export const terminal = (value: unknown) => String(value ?? "").replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 export const expand = (p: string) => resolve(p === "~" ? homedir() : p.startsWith("~/") ? join(homedir(), p.slice(2)) : p);

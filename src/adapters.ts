@@ -1,20 +1,27 @@
+import { readBytes } from "./io.ts";
+import { taskNotification, notificationText, notificationState, type NotificationAgent } from "./notifications.ts";
 import { extractMetadata, messageMetadata, originalIdentity, isoTimestamp, validateMessageMetadata, validateSessionMetadata } from "./metadata.ts";
 import { childFiles, nativeMedia } from "./continuity.ts";
-import { readFile, stat } from "node:fs/promises";
-import { extname, join, sep } from "node:path";
+import { stat } from "node:fs/promises";
+import { basename, extname, join, sep } from "node:path";
 import { randomUUID } from "node:crypto";
 import { arr, row, str, text, hash, unique, expand, contentBlocks, mappedMessages, BridgeError,
   isTitleText, roots, continuityText, type Branch, type Context, type Session, type Message, type Row, type Target, type Block } from "./model.ts";
 
 export function parseJsonl(data: string): Row[] {
-  return data.replace(/^\uFEFF/, "").split(/\r?\n/).flatMap((line, i) => {
-    if (!line.trim()) return [];
+  const records: Row[] = [];
+  let start = data.charCodeAt(0) === 0xfeff ? 1 : 0, lineNumber = 0;
+  while (start < data.length) {
+    let end = data.indexOf("\n", start); if (end < 0) end = data.length;
+    const line = data.slice(start, end); lineNumber++; start = end + 1;
+    if (!line.trim()) continue;
     try {
       const obj: unknown = JSON.parse(line);
       if (!obj || typeof obj !== "object" || Array.isArray(obj)) throw new Error("Expected an object");
-      return [obj as Row];
-    } catch { throw new BridgeError("MALFORMED_SESSION", `Invalid JSON object at line ${i + 1}.`, "If the session is active, wait for its current write and retry."); }
-  });
+      records.push(obj as Row);
+    } catch { throw new BridgeError("MALFORMED_SESSION", `Invalid JSON object at line ${lineNumber}.`, "If the session is active, wait for its current write and retry."); }
+  }
+  return records;
 }
 function claude(rows: Row[], history: "full" | "active" = "full", branch?: string, sidechain = false): Omit<Session, "format" | "source" | "sourcePath" | "sourceSha256" | "title"> {
   const nodes = new Map<string, { record: Row; index: number }[]>();
@@ -167,6 +174,8 @@ function portable(data: unknown): Session {
     for (const item of s.context) {
       const c = row(item);
       if (!["subagent", "memory", "retained", "communication"].includes(String(c.kind)) || typeof c.label !== "string" || (c.text !== undefined && typeof c.text !== "string")) throw new BridgeError("INVALID_SCHEMA", "Invalid supplemental context.");
+      for (const key of ["sourceId", "parentSourceId", "agentRole", "agentNickname", "spawnCallId"]) if (c[key] !== undefined && typeof c[key] !== "string") throw new BridgeError("INVALID_SCHEMA", `Invalid subagent ${key}.`);
+      if (c.metadata !== undefined) validateSessionMetadata(c.metadata);
       if (c.messages !== undefined) portable({ format: "session-bridge/v1", source: s.source, title: "context", warnings: [], messages: c.messages });
     }
   }
@@ -184,7 +193,7 @@ function portable(data: unknown): Session {
 export async function load(path: string, conversation?: string, history: "full" | "active" = "full", options: { branch?: string; children?: boolean; visited?: Set<string> } = {}) {
   path = expand(path);
   if ((await stat(path)).size > 512 * 1024 * 1024) throw new BridgeError("SESSION_TOO_LARGE", "Session exceeds 512 MiB.");
-  const raw = await readFile(path), decoded = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+  const raw = await readBytes(path), decoded = new TextDecoder("utf-8", { fatal: true }).decode(raw);
   let session: Session;
   const relatedSources: { path: string; raw: Uint8Array }[] = [];
   if (extname(path) === ".jsonl") {
@@ -193,7 +202,7 @@ export async function load(path: string, conversation?: string, history: "full" 
     const parsed = source === "codex" ? codex(rows, history) : claude(rows, history, options.branch, path.includes(`${sep}subagents${sep}`));
     if (source === "codex" && parsed.metadata && !parsed.metadata.title && path.startsWith(roots().codex + sep)) {
       try {
-        const index = parseJsonl(await readFile(join(roots().codex, "..", "session_index.jsonl"), "utf8"));
+        const index = parseJsonl(await Bun.file(join(roots().codex, "..", "session_index.jsonl")).text());
         const named = index.findLast(r => r.id === parsed.sourceId && str(r.thread_name));
         if (named) parsed.metadata.title = String(named.thread_name);
       } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") parsed.warnings.push("Codex title index could not be read; using transcript title."); }
@@ -208,13 +217,31 @@ export async function load(path: string, conversation?: string, history: "full" 
     session.workspace = inherited?.workspace as Session["workspace"];
     const visited = options.visited ?? new Set<string>(); visited.add(path);
     const children = options.children !== false ? await childFiles(path, source, rows, roots().codex) : { paths: [], missing: [] };
+    if (children.paths.length) session.context = session.context.filter(c => c.kind !== "subagent");
     session.warnings.push(...children.missing.map(id => `Subagent transcript unavailable locally: ${id}`));
     for (const child of children.paths) {
       if (visited.has(child)) continue;
       if (visited.size >= 128) { session.warnings.push("Subagent discovery stopped at 128 transcripts; remaining children require separate conversion."); break; }
       try {
         const loaded = await load(child, undefined, history, { visited });
-        session.context.push({ kind: "subagent", label: loaded.session.title, sourcePath: child, sourceId: loaded.session.sourceId, messages: loaded.session.messages });
+        const childRows = parseJsonl(Buffer.from(loaded.raw).toString("utf8"));
+        const childMeta = row(childRows.find(r => r.type === "session_meta")?.payload);
+        const spawnMeta = row(row(row(childMeta.source).subagent).thread_spawn);
+        let agentMeta: Row = {};
+        if (source === "claude") {
+          try {
+            const metadataPath = child.replace(/\.jsonl$/, ".meta.json"), metadataRaw = await readBytes(metadataPath);
+            agentMeta = row(JSON.parse(metadataRaw.toString("utf8")));
+            relatedSources.push({ path: metadataPath, raw: metadataRaw });
+            loaded.session.metadata?.records.push({ provider: "claude", type: "subagent-metadata", fields: agentMeta });
+          }
+          catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") session.warnings.push(`Subagent metadata unavailable: ${child}`); }
+        }
+        const childId = source === "claude" ? str(childRows.find(r => str(r.agentId))?.agentId) ?? basename(child, ".jsonl").replace(/^agent-/, "") : loaded.session.sourceId;
+        const parentId = source === "claude" && path.includes(`${sep}subagents${sep}`) ? basename(path, ".jsonl").replace(/^agent-/, "") : session.sourceId;
+        session.context.push({ kind: "subagent", label: str(agentMeta.description) ?? loaded.session.title, sourcePath: child, sourceId: childId,
+          parentSourceId: str(agentMeta.parentAgentId) ?? str(childMeta.parent_thread_id) ?? str(spawnMeta.parent_thread_id) ?? parentId, agentRole: str(agentMeta.agentType) ?? str(childMeta.agent_role) ?? str(spawnMeta.agent_role),
+          agentNickname: str(childMeta.agent_nickname) ?? str(spawnMeta.agent_nickname), spawnCallId: str(agentMeta.toolUseId), metadata: loaded.session.metadata, messages: loaded.session.messages });
         session.context.push(...(loaded.session.context ?? []));
         relatedSources.push({ path: child, raw: loaded.raw }, ...loaded.relatedSources);
         session.warnings.push(...loaded.session.warnings.map(w => `Subagent: ${w}`));
@@ -230,7 +257,7 @@ export async function load(path: string, conversation?: string, history: "full" 
   portable(session);
   return { session, raw, path, relatedSources };
 }
-export function native(s: Session, target: Target, id: string, cwd: string, timestamp: string): Row[] {
+export function native(s: Session, target: Target, id: string, cwd: string, timestamp: string, notificationAgents: Map<string, NotificationAgent> = new Map()): Row[] {
   const mapped: ReturnType<typeof mappedMessages> = [{ role: "user", id: undefined, metadata: undefined, text: `Conversation transferred from ${s.source} by baton. Prior tool activity is historical, not pending actions. Continue from the last turn using this app's current tools and permissions. Workspace files are checked, not copied. Supplemental history follows.\n\n${continuityText(s)}`, timestamp, originalRole: "user", blocks: [] }, ...mappedMessages(s)];
   const sessionBridge = { version: 1, session: { source: s.source, sourceId: s.sourceId, metadata: s.metadata, title: s.title, branches: s.branches?.map(({ id, current }) => ({ id, current })), selectedBranch: s.selectedBranch, context: s.context?.map(c => ({ ...c, messages: c.messages?.map(m => ({ ...m, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) })) })), workspace: s.workspace } };
   const messageBridge = (m: (typeof mapped)[number]) => ({ version: 1, message: { id: m.id, timestamp: m.timestamp, metadata: m.metadata, role: m.originalRole, blocks: m.blocks.map(b => b.kind === "reasoning" ? { kind: b.kind, text: "", format: b.format } : b) } });
@@ -258,7 +285,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
     catch { if (!git.repository.includes("@") || git.repository.startsWith("git@")) repository = git.repository; }
   }
   const records: Row[] = [{ timestamp, type: "session_meta", session_bridge: sessionBridge, payload: { id, session_id: id, timestamp, cwd,
-    originator: "baton", cli_version: "0.159.2", source: "cli", model_provider: "openai", history_mode: "legacy",
+    originator: "baton", cli_version: "0.159.2", source: "cli", model_provider: "openai", history_mode: "paginated",
     ...(git ? { git: { branch: git.branch, commit_hash: git.commit && /^[a-f0-9]{40,64}$/i.test(git.commit) ? git.commit : undefined, repository_url: repository } } : {}) } }];
   let turnId: string | undefined, lastAnswer: string | null = null, turnStart = timestamp, lastTime = timestamp;
   const event = (payload: Row, stamp = lastTime) => records.push({ timestamp: stamp, type: "event_msg", payload });
@@ -268,17 +295,32 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
   } };
   for (const [index, m] of mapped.entries()) {
     const stamp = isoTimestamp(m.timestamp) ?? timestamp;
-    if (m.role === "user" || !turnId) {
+    const notification = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
+    if ((!notification && m.role === "user") || !turnId) {
       finish(); turnId = randomUUID(); lastAnswer = null; turnStart = stamp;
       event({ type: "task_started", turn_id: turnId, root_turn_id: turnId, started_at: Math.floor(Date.parse(stamp) / 1000), collaboration_mode_kind: "default" }, stamp);
     }
     lastTime = stamp;
     const mid = `msg_${randomUUID().replaceAll("-", "")}`;
     const phase = m.metadata?.phase === "commentary" ? "commentary" : "final_answer";
+    if (notification) {
+      const content = notificationText(notification), agent = notificationAgents.get(notification.taskId) ?? notificationAgents.get(notification.toolUseId ?? "");
+      // Preserve source identity and complete XML for inverse conversion, while
+      // feeding readable historical context and a native event to the destination.
+      records.push({ timestamp: stamp, type: "response_item", session_bridge: messageBridge(m), payload: { type: "message", id: mid, role: "assistant", content: [{ type: "output_text", text: content }], phase: "commentary", internal_chat_message_metadata_passthrough: { turn_id: turnId } } });
+      event({ type: "item_completed", thread_id: id, turn_id: turnId, completed_at_ms: Date.parse(stamp), item: agent
+        ? { type: "CollabAgentToolCall", id: mid, tool: "wait", status: notification.status === "failed" ? "failed" : "completed", sender_thread_id: id, receiver_thread_ids: [agent.sessionId], receiver_agents: [{ thread_id: agent.sessionId, agent_nickname: agent.nickname, agent_role: agent.role }], prompt: content, agents_states: { [agent.sessionId]: notificationState(notification) } }
+        : { type: "AgentMessage", id: mid, content: [{ type: "Text", text: content }], phase: "commentary", memory_citation: null } }, stamp);
+      continue;
+    }
+
     records.push({ timestamp: stamp, type: "response_item", session_bridge: index === 0 ? { version: 1, message: { generated: true } } : messageBridge(m), payload: { type: "message", id: mid, role: m.role,
       content: [{ type: m.role === "user" ? "input_text" : "output_text", text: m.text }, ...(m.role === "user" ? nativeMedia(m.blocks, "codex") : [])],
       internal_chat_message_metadata_passthrough: { turn_id: turnId }, ...(m.role === "assistant" ? { phase } : {}) },
       metadata: { retained_source: { id: { message_id: mid, turn_id: turnId, role: m.role }, revision: `retained_${randomUUID()}`, complete: true }, client_authored: false } });
+    event({ type: "item_completed", thread_id: id, turn_id: turnId, completed_at_ms: Date.parse(stamp), item: m.role === "user"
+      ? { type: "UserMessage", id: mid, content: [{ type: "text", text: m.text, text_elements: [] }, ...nativeMedia(m.blocks, "codex").map(b => ({ type: "image", image_url: b.image_url }))] }
+      : { type: "AgentMessage", id: mid, content: [{ type: "Text", text: m.text }], phase, memory_citation: null } }, stamp);
     if (m.role === "assistant") {
       event({ type: "agent_message", message: m.text, phase, memory_citation: null });
       lastAnswer = m.text;

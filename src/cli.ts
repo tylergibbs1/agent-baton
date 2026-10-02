@@ -53,7 +53,7 @@ async function doctor() {
   return { version: VERSION, runtime: `Bun ${Bun.version}`, providers,
     capabilities: { claude: "Native transcript → claude --resume ID", codex: "Native rollout → codex resume ID; local Desktop source transcripts accepted",
       chatgpt: "conversations.json input; Markdown upload/paste output. No native desktop/cloud insertion.", portable: "Provider-neutral JSON, original bytes, and SHA-256 integrity manifest" },
-    notes: ["No model/cloud API calls made; native title registration uses local Codex storage RPC.", "Compressed Codex rollouts are unsupported; decompress a copy first.",
+    notes: ["No model turns started; native initialization and title registration use local Codex app-server RPC.", "Compressed Codex rollouts are unsupported; decompress a copy first.",
       "Native formats are internal. Tested against Claude Code 2.1.287 and Codex CLI 0.159.2."] };
 }
 async function* listPages(v: Record<string, string | number | boolean | undefined>) {
