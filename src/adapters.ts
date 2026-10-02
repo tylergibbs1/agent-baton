@@ -364,6 +364,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
         const notice = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
         const content = notice ? notificationText(notice) : m.text;
         append(notice ? 'assistant' : m.role, m.role === 'user' && !nativeMedia(m.blocks, 'claude').length ? content : [{ type: 'text', text: content }, ...(m.role === 'user' ? nativeMedia(m.blocks, 'claude') : [])], m, bridge);
+        if (index === 0) records.at(-1)!.isMeta = true;
         continue;
       }
       let role = m.role, content: Row[] = [], usedBridge = false;
@@ -416,6 +417,14 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
   const emitTool = (call: { id: string; name: string; arguments: unknown; turnId: string }, output: string | undefined, failed: boolean, stamp: string) => event({ type: "item_completed", thread_id: id, turn_id: call.turnId, completed_at_ms: Date.parse(stamp), item: { type: "DynamicToolCall", id: call.id, namespace: `${s.source}_history`, tool: call.name, arguments: call.arguments, status: failed ? "failed" : "completed", ...(output !== undefined ? { content_items: [{ type: "inputText", text: output }] } : {}), success: !failed, ...(failed ? { error: output ?? "Source call has no recorded result; imported inactive." } : {}) } }, stamp);
   for (const [index, m] of mapped.entries()) {
     const stamp = isoTimestamp(m.timestamp) ?? timestamp;
+    if (index === 0) {
+      // Context reconstruction reads response items. Paginated desktop history
+      // reads canonical items; generated transfer context has no visible item.
+      records.push({ timestamp: stamp, type: 'response_item', session_bridge: { version: 1, message: { generated: true } }, payload: {
+        type: 'message', id: `msg_${randomUUID().replaceAll('-', '')}`, role: 'user', content: [{ type: 'input_text', text: m.text }],
+      } });
+      continue;
+    }
     const notification = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
     const hasTools = m.blocks.some(b => b.kind === "tool_call" || b.kind === "tool_result");
     const chatBlocks = m.blocks.filter(b => b.kind !== "tool_call" && b.kind !== "tool_result");

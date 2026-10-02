@@ -41,7 +41,7 @@ export async function codexStorageSession<T>(operate: (request: StorageRequest) 
     });
   }
   try {
-    await request("initialize", { clientInfo: { name: "baton", version: "0.7.0" }, capabilities: { experimentalApi: true } });
+    await request("initialize", { clientInfo: { name: "baton", version: "0.7.1" }, capabilities: { experimentalApi: true } });
     proc.stdin.write('{"method":"initialized"}\n'); proc.stdin.flush();
     return await operate(request);
   } finally { proc.kill(); await proc.exited; await pump; }

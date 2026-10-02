@@ -1,6 +1,6 @@
 {
   "name": "agent-baton",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "Continue local agent conversations across Claude Code and Codex.",
   "type": "module",
   "bin": {

@@ -95,6 +95,9 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
     expect(JSON.stringify(childItems)).toContain("Child confirmed cents are integers.");
     expect(hydrated).toContain(m.subagents[0].sessionId);
     const parentItems = itemPage.data.map(entry => entry.item);
+    expect(parentItems.some(item => JSON.stringify(item).includes('Conversation transferred from'))).toBe(false);
+    expect(parentItems.some(item => JSON.stringify(item).includes('[Workspace check]'))).toBe(false);
+
     expect(parentItems.some(item => item.type === "collabAgentToolCall" && item.receiverThreadIds?.includes(m.subagents[0].sessionId))).toBe(true);
     const toolItems = parentItems.filter(item => item.type === "dynamicToolCall") as unknown as { tool: string; arguments: unknown; contentItems: { text: string }[]; status: string }[];
     expect(toolItems.find(item => item.tool === "Read")?.arguments).toEqual({ file_path: "invoice.ts" });
@@ -155,11 +158,11 @@ console.log(JSON.stringify({found:sessions.some(s=>s.sessionId===id),title:info?
 user:JSON.stringify(messages).includes('Use integer cents.'),tool:JSON.stringify(messages).includes('amount_cents: number'),
 pdf:messages.some(m=>Array.isArray(m.message.content)&&m.message.content.some(b=>b.type==='document'&&b.source?.media_type==='application/pdf')),
 image:messages.some(m=>Array.isArray(m.message.content)&&m.message.content.some(b=>b.type==='image'&&b.source?.media_type==='image/png')),
-last:JSON.stringify(messages).includes('CSV export, preserving cents.'),private:JSON.stringify(messages).includes('private scratchpad')}));`;
+last:JSON.stringify(messages).includes('CSV export, preserving cents.'),transferBubble:JSON.stringify(messages).includes('Conversation transferred from'),private:JSON.stringify(messages).includes('private scratchpad')}));`;
     const validation = Bun.spawn([process.execPath, "--eval", check], { env, cwd: fileURLToPath(new URL("..", import.meta.url)), stdout: "pipe", stderr: "pipe" });
     const result = await new Response(validation.stdout).json();
     expect(await validation.exited).toBe(0);
-    expect(result).toEqual({ found: true, title: "Invoice export", tag: "finance", branch: "feature/invoice", messages: 7, pdf: true, image: true, user: true, tool: true, last: true, private: false });
+    expect(result).toEqual({ found: true, title: "Invoice export", tag: "finance", branch: "feature/invoice", messages: 6, pdf: true, image: true, user: true, tool: true, last: true, transferBubble: false, private: false });
     const undo = Bun.spawn([process.execPath, cli, "undo", join(dir, "bundle"), "--json"], { env, stdout: "pipe", stderr: "pipe" });
     expect(await undo.exited).toBe(0);
     for (const path of [manifest.installedPath, ...manifest.subagents.map(c => c.installedPath)]) expect(await access(path).then(() => true, () => false)).toBe(false);
