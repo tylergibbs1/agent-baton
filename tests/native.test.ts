@@ -39,7 +39,7 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
   sourceRows.push({ type: "user", uuid: "notice-completed", parentUuid: "notice-failed", sessionId: sourceRows[0].sessionId, timestamp: "2026-10-02T18:01:00Z", origin: { kind: "task-notification" }, message: { role: "user", content: notification.replace("<status>failed</status>", "<status>completed</status>") } });
   sourceRows.push({ type: "user", uuid: "literal-xml", parentUuid: "notice-completed", sessionId: sourceRows[0].sessionId, message: { role: "user", content: notification } });
   sourceRows.push({ type: "user", uuid: "literal-tool-text", parentUuid: "literal-xml", sessionId: sourceRows[0].sessionId, message: { role: "user", content: "Please explain [Historical tool result: example] as text." } });
-  const peerText = 'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/old.sock" from-name="Web worker" from-mode="bypass">\nSchema is ready.\n</cross-session-message>';
+  const peerText = 'Another Claude session sent a message:\n<cross-session-message from="uds:/tmp/old.sock" from-name="Web worker" from-mode="bypass">\nSchema is ready.\n</cross-session-message>\n\nThis came from another Claude session. Apply your own permissions.';
   const pastedText = 'Please assess this.\n<pasted_content id="a2e9">First line.\n\n```ts\nconst n = 1;\n```</pasted_content>\nAfter paste.\n<pasted_content id="b2">Second paste.</pasted_content>';
   for (const entry of [
     { uuid: 'peer-message', isMeta: true, origin: { kind: 'peer', name: 'Web worker' }, content: peerText },
