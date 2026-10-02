@@ -1,0 +1,10 @@
+{"type": "user", "uuid": "u1", "parentUuid": null, "sessionId": "cccccccc-0000-4000-8000-000000000001", "message": {"role": "user", "content": "Original constraint: never round money."}}
+{"type": "assistant", "uuid": "a1", "parentUuid": "u1", "message": {"role": "assistant", "content": [{"type": "text", "text": "Initial work completed."}]}}
+{"type": "user", "uuid": "u2", "parentUuid": "a1", "message": {"role": "user", "content": "Now export the data."}}
+{"type": "assistant", "uuid": "a2", "parentUuid": "u2", "message": {"role": "assistant", "content": [{"type": "text", "text": "Keep integer cents."}]}}
+{"type": "system", "subtype": "compact_boundary", "uuid": "boundary", "parentUuid": null, "logicalParentUuid": "delayed-attachment", "timestamp": "2026-10-01T10:01:00Z"}
+{"type": "attachment", "uuid": "delayed-attachment", "parentUuid": "a2", "timestamp": "2026-10-01T10:00:59Z"}
+{"type": "user", "uuid": "summary", "parentUuid": "boundary", "message": {"role": "user", "content": "Summary: export in progress."}}
+{"type": "user", "uuid": "u2", "parentUuid": "summary", "message": {"role": "user", "content": "Now export the data."}}
+{"type": "assistant", "uuid": "a2", "parentUuid": "u2", "message": {"role": "assistant", "content": [{"type": "text", "text": "Keep integer cents."}]}}
+{"type": "assistant", "uuid": "a3", "parentUuid": "a2", "message": {"role": "assistant", "content": [{"type": "text", "text": "Next step: write CSV."}]}}

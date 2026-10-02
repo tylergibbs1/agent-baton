@@ -1,0 +1,8 @@
+node_modules/
+dist/
+bridge-exports/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+!.env.example
