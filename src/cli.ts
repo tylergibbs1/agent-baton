@@ -1,4 +1,6 @@
 #!/usr/bin/env bun
+import { setup } from "./setup.ts";
+import { handoff } from "./handoff.ts";
 import { definitions, commands, commandSchema, validate, fieldMask, project, VERSION, type Command } from "./contracts.ts";
 import { requestInput, readWindow, writeJson } from "./agent-io.ts";
 import { parseArgs } from "node:util";
@@ -10,6 +12,7 @@ import { discover, describe, resolveSession, convert, verify, undo, compressedCo
 const optionDefinitions = {
   json: { type: "boolean" }, human: { type: "boolean" }, help: { type: "boolean", short: "h" }, version: { type: "boolean" },
   request: { type: "string" }, output: { type: "string" }, fields: { type: "string" }, pretty: { type: "boolean" }, "page-all": { type: "boolean" }, "max-pages": { type: "string" }, "max-bytes": { type: "string" }, "idempotency-key": { type: "string" }, "expected-source-sha256": { type: "string" },
+  from: { type: "string" }, session: { type: "string" }, client: { type: "string" }, bin: { type: "string" },
   source: { type: "string" }, input: { type: "string" }, limit: { type: "string" }, offset: { type: "string" }, search: { type: "string" },
   branch: { type: "string" }, "workspace-check": { type: "string" }, history: { type: "string" }, cwd: { type: "string" }, to: { type: "string" }, conversation: { type: "string" }, out: { type: "string" }, install: { type: "boolean" }, "dry-run": { type: "boolean" },
 } as const;
@@ -91,12 +94,17 @@ function printHuman(result: unknown, command: string) {
     }
     console.log("\nNext: baton inspect AGENT:SESSION");
     if (r.nextOffset !== null) console.log(`More: baton list --offset ${r.nextOffset}`);
+  } else if (command === "setup") {
+    const r = result as Awaited<ReturnType<typeof setup>>;
+    console.log(`Baton commands ${r.dryRun ? "preview" : "ready"}`);
+    for (const c of r.commands) console.log(`${c.client}: ${c.invocation}${c.client === "codex" ? " (or select Baton in the app skill picker)" : ""}\n  ${terminal(c.path)}\n  No-quota fallback: ${terminal(c.runner)} handoff --from ${c.client} --session ID`);
+    for (const note of r.notes) console.log(note);
   } else if (command === "branches") {
     const r = result as { selected?: string; branches: { id: string; title?: string }[] };
     if (!r.branches.length) { console.log("No alternate branches in this sequential rollout."); return; }
     for (const b of r.branches) console.log(`${b.id === r.selected ? "*" : " "} ${terminal(b.id)}  ${terminal(b.title ?? "")}`);
     console.log("\nSelect: baton convert SESSION --branch NODE --to TARGET");
-  } else if (command === "convert" || command === "inspect") {
+  } else if (command === "convert" || command === "handoff" || command === "inspect") {
     const r = result as ReturnType<typeof report> & { dryRun?: boolean; output?: string; resumeCommand?: string; nextStep?: string };
     console.log(`\n${r.dryRun ? "Preview" : "Conversation"} · ${terminal(r.title)}\n${r.source} → ${r.target} · ${r.messages} messages (${r.historyMode} history) · ${r.contextBytes.toLocaleString()} context bytes\nProject: ${terminal(r.cwd ?? "unspecified")}`);
     console.log(`Context: ${r.continuity.subagents} subagents · ${r.continuity.contextRecords} supplemental records · ${r.continuity.attachments.total} attachments · ${r.continuity.workspaceMismatches} workspace mismatches`);
@@ -167,6 +175,8 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     }
     let result: unknown;
     if (command === "doctor") result = await doctor();
+    else if (command === "setup") result = await setup({ client: v.client as "all" | "claude" | "codex" | undefined, bin: v.bin as string | undefined, dryRun: Boolean(v["dry-run"]) });
+    else if (command === "handoff") result = await handoff({ from: v.from as "claude" | "codex" | undefined, session: v.session as string | undefined, to: v.to as "claude" | "codex" | undefined, history: v.history as "full" | "active" | undefined, out: v.out as string | undefined, cwd: v.cwd as string | undefined, dryRun: Boolean(v["dry-run"]), workspaceCheck: v["workspace-check"] as "warn" | "strict" | "off" | undefined });
     else if (command === "schema") result = schema(v.command as Command | undefined);
     else if (command === "verify") result = await verify(String(v.bundle));
     else if (command === "undo") result = await undo(String(v.bundle), Boolean(v["dry-run"]));

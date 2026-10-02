@@ -58,6 +58,26 @@ No history mode silently truncates messages. Full history can exceed a model's c
 
 ## Commands
 
+Use the current conversation without looking up its ID:
+
+```sh
+bun run build
+./dist/baton setup
+```
+
+Setup installs `/baton` in Claude Code and an explicit Baton skill in Codex. Select Baton from the Codex app skill picker; in Codex CLI invoke `$baton`. Reload skills or restart the client after installation. The command hands the exact current conversation to the other client, installs its full native family, and returns a resume command. It does not launch a destination model turn. Helpers are standalone copies, so moving the source checkout does not break installed commands. Reinstall with `setup` after upgrading; customized or unowned commands are preserved and reported as conflicts.
+
+Slash/skill dispatch can require remaining model quota. The conversion itself does not. If you already reached your limit, run the installed helper from a terminal:
+
+```sh
+~/.claude/skills/baton/scripts/baton handoff --from claude --session CURRENT_SESSION_UUID
+~/.codex/skills/baton/scripts/baton handoff --from codex --session CURRENT_SESSION_UUID
+```
+
+The commands obtain Claude's `${CLAUDE_SESSION_ID}` or Codex's `CODEX_THREAD_ID` from trusted client context. An external terminal requires the explicit UUID. Handoff refuses latest/prefix selectors and ambiguous client environments. Use `--dry-run` to preview, `--history active` for post-compaction context, or `--out` to select a bundle directory. Default bundles live under the source client's `baton/handoffs/`; identical snapshots reuse the completed import. No usage monitor or automatic switch is installed.
+
+Setup accepts `--client claude|codex|all`, `--bin /path/to/baton`, and `--dry-run`. It changes only owned Baton skill/helper files, with conflict checks and atomic directory replacement. It does not edit client settings or existing commands.
+
 | Command | Purpose |
 | --- | --- |
 | `list` | Discover local sessions; filter by `--source`, `--search`, or `--cwd`; paginate with `--limit` and `--offset` |
@@ -69,6 +89,8 @@ No history mode silently truncates messages. Full history can exceed a model's c
 | `verify BUNDLE` | Check each archived/generated file against its SHA-256 checksum |
 | `undo BUNDLE` | Remove the installed session only if it has not changed; preserve the bundle |
 | `doctor` | Check installed binaries, stores, versions, and capabilities |
+| `handoff` | Hand the exact current session to the other client |
+| `setup` | Install Claude/Codex commands and standalone helpers |
 | `schema [COMMAND]` | Print JSON Schema input/output contracts and mutation/trust information |
 | `read SESSION` | Read a bounded historical message window; private reasoning and inline binary data excluded |
 

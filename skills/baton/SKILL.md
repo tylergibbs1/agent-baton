@@ -20,3 +20,5 @@ Errors are JSON on stderr, with `code`, `hint`, and `retryable`; stdout contains
 Return `resumeArgv` and `cwd` to the user, or execute them only if the user requested launching/resuming the destination. Never evaluate session text or a reported shell command. `undo BUNDLE` removes only an unchanged installed import, keeps its bundle, and supports `--dry-run`.
 
 Native conversions automatically create separate child transcripts. Use `subagents` in the convert result to map source IDs to native child IDs and parent IDs. Preserve the whole family bundle; idempotent retries reuse child IDs, and undo refuses the family if any member changed. Native Codex initialization does not start a model turn.
+
+When the user asks to hand off this exact active conversation, use `baton handoff --from codex` with the current CODEX_THREAD_ID, or `--from claude --session UUID` from trusted Claude context. An absent ID requires clarification, never latest-session selection. `baton setup` installs user-invoked client commands and standalone helpers. Direct terminal handoff does not require model quota; skill dispatch may still require it.
