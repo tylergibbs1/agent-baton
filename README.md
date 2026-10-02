@@ -111,7 +111,7 @@ There is no native ChatGPT desktop/cloud history insertion. Codex native imports
 ## What transfers
 
 - User and assistant text remains in order, including code and user constraints.
-- Tool calls, arguments, outputs, error markers, original roles, and call/result IDs survive native round trips in bridge extensions. Destination readers see labeled historical text; tools are never replayed or registered.
+- Tool calls, arguments, outputs, error markers, original roles, and call/result IDs survive native round trips in bridge extensions. Codex readers show native imported tool-history cards with arguments and results; other destinations see labeled historical text. Tools are never replayed or registered. Unfinished source calls are marked inactive with an explicit missing-result error, rather than left live. Mixed messages retain their actual user/assistant prose separately from tool activity.
 - System/developer/tool messages become labeled conversation history. Destination policies, approval settings, credentials, and model selection remain the destination's own.
 - Private reasoning is excluded from the resumed context. Original reasoning bytes, if present in the source, remain in the archive.
 - Inline and local attachments are copied into checksum-verified `assets/` files. User images map into native Claude and Codex content blocks; PDFs map into Claude document blocks. Other documents/audio/video remain accessible through explicit local file links. Remote URLs and cloud-only asset IDs are reported as unresolved; no authenticated download is attempted.

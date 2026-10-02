@@ -1,5 +1,5 @@
 import { BridgeError, row } from "./model.ts";
-export const VERSION = "0.6.0";
+export const VERSION = "0.6.1";
 export interface Shape { type?: string | string[]; description?: string; enum?: unknown[]; minimum?: number; maximum?: number; minLength?: number; maxLength?: number; pattern?: string; properties?: Record<string, Shape>; items?: Shape; additionalProperties?: boolean | Shape; required?: string[]; default?: unknown }
 const string = (description: string, extra: Partial<Shape> = {}): Shape => ({ type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f-\\u009f]+$", description, ...extra });
 const boolean = (description: string): Shape => ({ type: "boolean", description });

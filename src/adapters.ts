@@ -5,7 +5,7 @@ import { childFiles, nativeMedia } from "./continuity.ts";
 import { stat } from "node:fs/promises";
 import { basename, extname, join, sep } from "node:path";
 import { randomUUID } from "node:crypto";
-import { arr, row, str, text, hash, unique, expand, contentBlocks, mappedMessages, BridgeError,
+import { arr, row, str, text, hash, unique, expand, contentBlocks, mappedMessages, renderBlocks, BridgeError,
   isTitleText, roots, continuityText, type Branch, type Context, type Session, type Message, type Row, type Target, type Block } from "./model.ts";
 
 export function parseJsonl(data: string): Row[] {
@@ -176,6 +176,7 @@ function portable(data: unknown): Session {
       if (!["subagent", "memory", "retained", "communication"].includes(String(c.kind)) || typeof c.label !== "string" || (c.text !== undefined && typeof c.text !== "string")) throw new BridgeError("INVALID_SCHEMA", "Invalid supplemental context.");
       for (const key of ["sourceId", "parentSourceId", "agentRole", "agentNickname", "spawnCallId"]) if (c[key] !== undefined && typeof c[key] !== "string") throw new BridgeError("INVALID_SCHEMA", `Invalid subagent ${key}.`);
       if (c.metadata !== undefined) validateSessionMetadata(c.metadata);
+      if (c.sourceAliases !== undefined && (!Array.isArray(c.sourceAliases) || c.sourceAliases.some(value => typeof value !== "string" || !value))) throw new BridgeError("INVALID_SCHEMA", "Invalid subagent source aliases.");
       if (c.messages !== undefined) portable({ format: "session-bridge/v1", source: s.source, title: "context", warnings: [], messages: c.messages });
     }
   }
@@ -238,10 +239,12 @@ export async function load(path: string, conversation?: string, history: "full" 
           catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") session.warnings.push(`Subagent metadata unavailable: ${child}`); }
         }
         const childId = source === "claude" ? str(childRows.find(r => str(r.agentId))?.agentId) ?? basename(child, ".jsonl").replace(/^agent-/, "") : loaded.session.sourceId;
+        const bridgedId = str(row(row(childRows.find(r => r.type === "session_meta")?.session_bridge).session).sourceId);
+        const originalContext = arr(inherited?.context).map(row).find(c => c.sourceId === bridgedId || c.sourceId === childId);
         const parentId = source === "claude" && path.includes(`${sep}subagents${sep}`) ? basename(path, ".jsonl").replace(/^agent-/, "") : session.sourceId;
         session.context.push({ kind: "subagent", label: str(agentMeta.description) ?? loaded.session.title, sourcePath: child, sourceId: childId,
           parentSourceId: str(agentMeta.parentAgentId) ?? str(childMeta.parent_thread_id) ?? str(spawnMeta.parent_thread_id) ?? parentId, agentRole: str(agentMeta.agentType) ?? str(childMeta.agent_role) ?? str(spawnMeta.agent_role),
-          agentNickname: str(childMeta.agent_nickname) ?? str(spawnMeta.agent_nickname), spawnCallId: str(agentMeta.toolUseId), metadata: loaded.session.metadata, messages: loaded.session.messages });
+          agentNickname: str(childMeta.agent_nickname) ?? str(spawnMeta.agent_nickname), spawnCallId: str(agentMeta.toolUseId) ?? str(originalContext?.spawnCallId), sourceAliases: unique([bridgedId, ...arr(originalContext?.sourceAliases).map(str)].filter((value): value is string => Boolean(value) && value !== childId)), metadata: loaded.session.metadata, messages: loaded.session.messages });
         session.context.push(...(loaded.session.context ?? []));
         relatedSources.push({ path: child, raw: loaded.raw }, ...loaded.relatedSources);
         session.warnings.push(...loaded.session.warnings.map(w => `Subagent: ${w}`));
@@ -293,10 +296,15 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
     const start = Date.parse(turnStart), end = Math.max(start, Date.parse(lastTime));
     event({ type: "task_complete", turn_id: turnId, last_agent_message: lastAnswer, started_at: Math.floor(start / 1000), completed_at: Math.floor(end / 1000), duration_ms: end - start });
   } };
+  const toolCalls = new Map<string, { id: string; name: string; arguments: unknown; turnId: string; start: string }>();
+  const emitTool = (call: { id: string; name: string; arguments: unknown; turnId: string }, output: string | undefined, failed: boolean, stamp: string) => event({ type: "item_completed", thread_id: id, turn_id: call.turnId, completed_at_ms: Date.parse(stamp), item: { type: "DynamicToolCall", id: call.id, namespace: `${s.source}_history`, tool: call.name, arguments: call.arguments, status: failed ? "failed" : "completed", ...(output !== undefined ? { content_items: [{ type: "inputText", text: output }] } : {}), success: !failed, ...(failed ? { error: output ?? "Source call has no recorded result; imported inactive." } : {}) } }, stamp);
   for (const [index, m] of mapped.entries()) {
     const stamp = isoTimestamp(m.timestamp) ?? timestamp;
     const notification = taskNotification({ role: m.originalRole, blocks: m.blocks, metadata: m.metadata });
-    if ((!notification && m.role === "user") || !turnId) {
+    const hasTools = m.blocks.some(b => b.kind === "tool_call" || b.kind === "tool_result");
+    const chatBlocks = m.blocks.filter(b => b.kind !== "tool_call" && b.kind !== "tool_result");
+    const chatText = hasTools ? renderBlocks(chatBlocks) : m.text;
+    if ((!notification && m.role === "user" && (!hasTools || chatText)) || !turnId) {
       finish(); turnId = randomUUID(); lastAnswer = null; turnStart = stamp;
       event({ type: "task_started", turn_id: turnId, root_turn_id: turnId, started_at: Math.floor(Date.parse(stamp) / 1000), collaboration_mode_kind: "default" }, stamp);
     }
@@ -314,6 +322,30 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
       continue;
     }
 
+    if (hasTools) {
+      // Model context stays labeled history. Canonical items control display;
+      // archived source tools are never registered or replayed.
+      records.push({ timestamp: stamp, type: "response_item", session_bridge: messageBridge(m), payload: { type: "message", id: mid, role: "assistant", content: [{ type: "output_text", text: `[Imported historical tool activity; no source task is live.]\n${m.text}` }], phase: "commentary", internal_chat_message_metadata_passthrough: { turn_id: turnId } } });
+      if (chatText) event({ type: "item_completed", thread_id: id, turn_id: turnId, completed_at_ms: Date.parse(stamp), item: m.role === "user"
+        ? { type: "UserMessage", id: mid, content: [{ type: "text", text: chatText, text_elements: [] }, ...nativeMedia(chatBlocks, "codex").map(b => ({ type: "image", image_url: b.image_url }))] }
+        : { type: "AgentMessage", id: mid, content: [{ type: "Text", text: chatText }], phase, memory_citation: null } }, stamp);
+      for (const b of m.blocks) {
+        if (b.kind === "tool_call") {
+          const callId = b.callId ?? randomUUID(), previous = toolCalls.get(callId);
+          if (previous) emitTool(previous, "Source call ID was reused without a recorded result; imported inactive.", true, stamp);
+          let argumentsValue: unknown; try { argumentsValue = JSON.parse(b.text); } catch { argumentsValue = { source_arguments: b.text }; }
+          const call = { id: `tool_${randomUUID()}`, name: b.name ?? "source_tool", arguments: argumentsValue, turnId: turnId!, start: stamp };
+          toolCalls.set(callId, call);
+          event({ type: "item_started", thread_id: id, turn_id: turnId, started_at_ms: Date.parse(stamp), item: { type: "DynamicToolCall", id: call.id, namespace: `${s.source}_history`, tool: call.name, arguments: call.arguments, status: "in_progress" } }, stamp);
+        } else if (b.kind === "tool_result") {
+          const call = toolCalls.get(b.callId ?? "") ?? { id: `tool_${randomUUID()}`, name: b.name ?? "source_tool_result", arguments: { source_call_id: b.callId ?? null }, turnId: turnId!, start: stamp };
+          emitTool(call, b.text, Boolean(b.isError), stamp); toolCalls.delete(b.callId ?? "");
+        }
+      }
+      if (m.role === "assistant" && chatText) lastAnswer = chatText;
+      continue;
+    }
+
     records.push({ timestamp: stamp, type: "response_item", session_bridge: index === 0 ? { version: 1, message: { generated: true } } : messageBridge(m), payload: { type: "message", id: mid, role: m.role,
       content: [{ type: m.role === "user" ? "input_text" : "output_text", text: m.text }, ...(m.role === "user" ? nativeMedia(m.blocks, "codex") : [])],
       internal_chat_message_metadata_passthrough: { turn_id: turnId }, ...(m.role === "assistant" ? { phase } : {}) },
@@ -326,6 +358,7 @@ export function native(s: Session, target: Target, id: string, cwd: string, time
       lastAnswer = m.text;
     } else event({ type: "user_message", message: m.text, images: nativeMedia(m.blocks, "codex").map(b => b.image_url), local_images: [], text_elements: [] });
   }
+  for (const call of toolCalls.values()) emitTool(call, undefined, true, lastTime);
   finish();
   return records.map((r, ordinal) => ({ ...r, ordinal }));
 }

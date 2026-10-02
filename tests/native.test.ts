@@ -32,9 +32,13 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
   const source = await mediaFixture(dir);
   const sourceRows = (await readFile(source, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   const notification = '<task-notification><task-id>source-worker</task-id><tool-use-id>original-spawn</tool-use-id><status>failed</status><summary>Weekly limit reached; HTTP 429.</summary><result>Audit saved.</result><worktree><worktreePath>/historical/audit</worktreePath></worktree><future-field>retain me</future-field></task-notification>';
+  sourceRows.push({ type: "assistant", uuid: "spawn-call", parentUuid: sourceRows.findLast(row => row.message)?.uuid, sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "original-spawn", name: "Agent", input: { description: "Audit worker", prompt: "Audit integer cents.", run_in_background: true } }] } });
+  sourceRows.push({ type: "user", uuid: "spawn-result", parentUuid: "spawn-call", sessionId: sourceRows[0].sessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "original-spawn", content: "Async agent launched successfully. agentId: source-worker. The agent is working in the background." }] } });
   sourceRows.push({ type: "user", uuid: "notice-failed", parentUuid: sourceRows.findLast(row => row.message)?.uuid, sessionId: sourceRows[0].sessionId, timestamp: "2026-10-02T18:00:00Z", origin: { kind: "task-notification" }, message: { role: "user", content: notification } });
   sourceRows.push({ type: "user", uuid: "notice-completed", parentUuid: "notice-failed", sessionId: sourceRows[0].sessionId, timestamp: "2026-10-02T18:01:00Z", origin: { kind: "task-notification" }, message: { role: "user", content: notification.replace("<status>failed</status>", "<status>completed</status>") } });
   sourceRows.push({ type: "user", uuid: "literal-xml", parentUuid: "notice-completed", sessionId: sourceRows[0].sessionId, message: { role: "user", content: notification } });
+  sourceRows.push({ type: "user", uuid: "literal-tool-text", parentUuid: "literal-xml", sessionId: sourceRows[0].sessionId, message: { role: "user", content: "Please explain [Historical tool result: example] as text." } });
+  sourceRows.push({ type: "assistant", uuid: "unfinished-call", parentUuid: "literal-tool-text", sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "unfinished", name: "Read", input: { file_path: "missing-result.ts" } }] } });
   await writeFile(source, sourceRows.map(r => JSON.stringify(r)).join("\n") + "\n");
   const exported = Bun.spawn([process.execPath, cli, "convert", source, "--to", "codex", "--install", "--cwd", dir, "--out", join(dir, "bundle"), "--idempotency-key", "native-family", "--json"], { env, stdout: "pipe", stderr: "pipe" });
   const m = await new Response(exported.stdout).json() as { sessionId: string; installedPath: string; subagents: { sessionId: string; installedPath: string }[] };
@@ -91,6 +95,12 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
     expect(hydrated).toContain(m.subagents[0].sessionId);
     const parentItems = itemPage.data.map(entry => entry.item);
     expect(parentItems.some(item => item.type === "collabAgentToolCall" && item.receiverThreadIds?.includes(m.subagents[0].sessionId))).toBe(true);
+    const toolItems = parentItems.filter(item => item.type === "dynamicToolCall") as unknown as { tool: string; arguments: unknown; contentItems: { text: string }[]; status: string }[];
+    expect(toolItems.find(item => item.tool === "Read")?.arguments).toEqual({ file_path: "invoice.ts" });
+    expect(toolItems.find(item => item.tool === "Read")?.contentItems[0].text).toBe("amount_cents: number");
+    expect(toolItems.find(item => item.tool === "Agent")?.contentItems[0].text).toContain("Async agent launched successfully.");
+    expect(toolItems.find(item => JSON.stringify(item.arguments).includes("missing-result.ts"))?.status).toBe("failed");
+    expect(parentItems.filter(item => item.type === "userMessage" && JSON.stringify(item).includes("Historical tool result"))).toHaveLength(1);
     const taskEvents = parentItems.filter(item => item.type === "collabAgentToolCall" && JSON.stringify(item).includes("Weekly limit reached"));
     expect(taskEvents).toHaveLength(2);
     expect(JSON.stringify(taskEvents[0])).toContain("errored");

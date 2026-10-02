@@ -37,6 +37,7 @@ export function renderFamily(s: Session, target: "claude" | "codex", id: string,
   contexts.forEach((c, i) => {
     const agent = { sessionId: plans[i].sessionId, nickname: c.agentNickname ?? c.label.slice(0, 80), role: codexRole(c) };
     notificationAgents.set(plans[i].sourceId, agent);
+    for (const alias of c.sourceAliases ?? []) notificationAgents.set(alias, agent);
     if (c.spawnCallId) notificationAgents.set(c.spawnCallId, agent);
   });
   const references = contexts.map((c, i) => ({ ...c, messages: undefined, text: `Native child session ${plans[i].sessionId} (historical import).\nLast recorded assistant response:\n${c.messages?.findLast(m => m.role === "assistant")?.blocks.filter(b => b.kind !== "reasoning").map(b => b.text).join("\n") ?? "No assistant response recorded."}` }));

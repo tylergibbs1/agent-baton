@@ -7,7 +7,7 @@ export type Target = Provider | "portable";
 export type BlockKind = "text" | "tool_call" | "tool_result" | "reasoning" | "media" | "summary" | "unsupported";
 export interface Asset { mime?: string; data?: string; path?: string; url?: string; pointer?: string; bundlePath?: string; sha256?: string; status?: "copied" | "missing" | "remote" | "unresolved" }
 export interface Branch { id: string; current: boolean; title?: string }
-export interface Context { kind: "subagent" | "memory" | "retained" | "communication"; label: string; text?: string; messages?: Message[]; sourcePath?: string; sourceId?: string; parentSourceId?: string; agentRole?: string; agentNickname?: string; spawnCallId?: string; metadata?: SessionMetadata }
+export interface Context { kind: "subagent" | "memory" | "retained" | "communication"; label: string; text?: string; messages?: Message[]; sourcePath?: string; sourceId?: string; parentSourceId?: string; agentRole?: string; agentNickname?: string; spawnCallId?: string; sourceAliases?: string[]; metadata?: SessionMetadata }
 export interface Workspace { source?: { cwd: string; git?: Workspace["git"] }; cwd: string; exists: boolean; git?: { root?: string; branch?: string; commit?: string; dirty: { path: string; sha256?: string; status: string }[] }; referenced: { path: string; exists: boolean }[]; mismatches: string[] }
 export interface Block { kind: BlockKind; text: string; name?: string; callId?: string; format?: string; isError?: boolean; asset?: Asset }
 export interface Message { role: string; blocks: Block[]; timestamp?: string | number | null; id?: string; metadata?: MessageMetadata }
@@ -89,7 +89,7 @@ export function report(s: Session, target: Target): Report {
   const messages = [...s.messages, ...(s.context ?? []).flatMap(c => c.messages ?? [])];
   for (const m of messages) for (const b of m.blocks) counts[b.kind] = (counts[b.kind] ?? 0) + 1;
   const mapped = mappedMessages(s), warnings = [...s.warnings];
-  if (counts.tool_call || counts.tool_result) warnings.push("Tool calls/results transfer as historical text; destination tools use their own schemas.");
+  if (counts.tool_call || counts.tool_result) warnings.push(target === "codex" ? "Tool calls/results appear as imported tool-history cards; source tools are not registered or replayed." : "Tool calls/results transfer as historical text; destination tools use their own schemas.");
   if (counts.reasoning) warnings.push(`${counts.reasoning} private reasoning blocks excluded from resumed context; original bytes stay archived.`);
   if (counts.media) warnings.push(`${counts.media} attachments: local/inline assets are bundled; unresolved references are reported explicitly.`);
   if (counts.unsupported) warnings.push(`${counts.unsupported} unrecognized content blocks transfer as labeled text.`);
