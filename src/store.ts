@@ -147,7 +147,7 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
   }
   else session.workspace = undefined;
   const prepared = await prepareAssets(session, input.path, output); session = prepared.session;
-  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 8, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
+  const requestSha256 = options.idempotencyKey ? hash(encode({ nativeFamilyLayout: 9, source: hash(input.raw), related: (input.relatedSources ?? []).map(s => hash(s.raw)), target, cwd,
     history: session.historyMode ?? "full", branch: session.selectedBranch, install: Boolean(options.install), workspaceCheck: options.workspaceCheck ?? "warn",
     assets: Object.fromEntries(Object.entries(prepared.artifacts).map(([name, bytes]) => [name, hash(bytes)])) })) : undefined;
   if (outputExists && options.idempotencyKey) {
@@ -172,6 +172,15 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
     }
     return { ...previous, reused: true, dryRun: Boolean(options.dryRun), installedSessionChanged };
   }
+  let nativeResume: Session | undefined;
+  if (target === 'codex' && (session.historyMode ?? 'full') === 'full' && report(session, target).contextBytes > 400_000 && /\.jsonl(?:\.zst)?$/.test(input.path)) {
+    const active = await load(input.path, undefined, 'active', { children: false, branch: input.session.source === 'claude' ? session.selectedBranch : undefined });
+    if (hash(active.raw) !== hash(input.raw)) throw new BridgeError('SOURCE_CHANGED', 'Source changed while preparing its compacted resume context.');
+    if (active.session.messages.length < session.messages.length) {
+      nativeResume = { ...active.session, cwd, context: [{ kind: 'memory', label: 'Baton complete history archive', text: `Full conversation, supplemental memory, original metadata and subagent history remain in ${join(output, 'session.json')}. Retrieve earlier details with Baton bounded read commands when needed. Source tasks are historical, not live; use current tools and permissions.` }], workspace: undefined };
+      session.warnings.push('Codex model context resumes from the latest source compaction. Full visible history and supplemental records remain archived and retrievable.');
+    }
+  }
   const preview = report(session, target);
   if (!preview.messages) throw new BridgeError("EMPTY_SESSION", "No transferable messages remain after filtering.");
   const installedPath = options.install ? destination(target as "claude" | "codex", sessionId, cwd, stamp) : undefined;
@@ -192,7 +201,7 @@ export async function convert(input: { session: Session; raw: Uint8Array; path: 
     ["source-original" + (input.path.endsWith(".jsonl.zst") ? ".jsonl.zst" : extname(input.path) === ".jsonl" ? ".jsonl" : ".json")]: input.raw,
     "conversation.md": Buffer.from(markdown(session)) };
   for (const [index, source] of (input.relatedSources ?? []).entries()) artifacts[`sources/${index}-${hash(source.raw)}${source.path.endsWith(".jsonl.zst") ? ".jsonl.zst" : extname(source.path) === ".json" ? ".json" : ".jsonl"}`] = source.raw;
-  if (target === "claude" || target === "codex") Object.assign(artifacts, renderFamily(session, target, sessionId, cwd, stamp, children));
+  if (target === "claude" || target === "codex") Object.assign(artifacts, renderFamily(session, target, sessionId, cwd, stamp, children, nativeResume));
   result.sha256 = Object.fromEntries(Object.entries(artifacts).map(([name, data]) => [name, hash(data)]));
   // Create parents separately so the final output directory always has exclusive ownership.
   const parent = join(output, ".."); await mkdir(parent, { recursive: true, mode: 0o700 });

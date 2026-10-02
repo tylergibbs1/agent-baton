@@ -29,7 +29,7 @@ export function planChildren(s: Session, target: "claude" | "codex", rootId: str
 export function claudeChildPath(rootPath: string, rootId: string, agentId: string) {
   return join(rootPath, "..", rootId, "subagents", `agent-${agentId}.jsonl`);
 }
-export function renderFamily(s: Session, target: "claude" | "codex", id: string, cwd: string, stamp: string, plans: NativeChild[]): Record<string, Uint8Array> {
+export function renderFamily(s: Session, target: "claude" | "codex", id: string, cwd: string, stamp: string, plans: NativeChild[], resume?: Session): Record<string, Uint8Array> {
   const contexts = (s.context ?? []).filter(c => c.kind === "subagent" && c.messages?.length);
   const codexRole = (c: Context) => c.agentRole === "explorer" || c.agentRole === "Explore" ? "explorer" : c.agentRole === "worker" ? "worker" : "default";
   const claudeRole = (c: Context) => c.agentRole === "explorer" || c.agentRole === "Explore" ? "Explore" : "general-purpose";
@@ -71,7 +71,13 @@ export function renderFamily(s: Session, target: "claude" | "codex", id: string,
     if (rows[1]?.parentUuid === first.uuid) rows[1].parentUuid = uId;
     rows.splice(1, 0, ...added); return rows;
   }
-  artifacts[`${target}.jsonl`] = encode(links(native(parent, target, id, cwd, stamp, notificationAgents), id));
+  const parentRows: Row[] = links(native(parent, target, id, cwd, stamp, notificationAgents), id);
+  if (target === 'codex' && resume) {
+    const replacement = native(resume, target, id, cwd, stamp, notificationAgents).filter(r => r.type === 'response_item').map(r => r.payload);
+    if (Buffer.byteLength(JSON.stringify(replacement)) > 400_000) throw new BridgeError('RESUME_CONTEXT_TOO_LARGE', 'Latest source compaction still exceeds the conservative resume budget.', 'Compact the source session again before transferring. Full history has not been truncated.');
+    parentRows.push({ ordinal: parentRows.length, timestamp: stamp, type: 'compacted', session_bridge: { version: 1, message: { generated: true } }, payload: { message: 'Baton resumed from the latest recorded source compaction; full visible history remains available.', replacement_history: replacement } });
+  }
+  artifacts[`${target}.jsonl`] = encode(parentRows);
   for (const [index, p] of plans.entries()) {
     const c = contexts[index];
     const child: Session = { format: s.format, source: s.source, sourceId: c.sourceId, title: c.label, cwd, messages: c.messages!, warnings: [], metadata: c.metadata };

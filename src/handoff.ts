@@ -18,6 +18,6 @@ export async function handoff(options: ConvertOptions & { from?: "claude" | "cod
   if (input.session.source !== from) throw new BridgeError("SOURCE_MISMATCH", "The selected session belongs to a different client.");
   const to = options.to ?? (from === "claude" ? "codex" : "claude");
   if (to === from) throw new BridgeError("INVALID_TARGET", "A handoff must select the other client.");
-  const fingerprint = hash(JSON.stringify({ source: hash(input.raw), related: input.relatedSources.map(s => hash(s.raw)), to, cwd: options.cwd ?? input.session.cwd, history: options.history ?? "full", workspace: options.workspaceCheck ?? "warn", layout: 8 }));
+  const fingerprint = hash(JSON.stringify({ source: hash(input.raw), related: input.relatedSources.map(s => hash(s.raw)), to, cwd: options.cwd ?? input.session.cwd, history: options.history ?? "full", workspace: options.workspaceCheck ?? "warn", layout: 9 }));
   return convert(input, to, { ...options, install: true, out: options.out ?? join(roots()[from], "..", "baton", "handoffs", fingerprint), idempotencyKey: options.idempotencyKey ?? "handoff-v1" });
 }

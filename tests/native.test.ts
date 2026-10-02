@@ -32,6 +32,9 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
   const dir = await mkdtemp(join(tmpdir(), "baton-native-")), env = { ...process.env, CODEX_HOME: join(dir, "codex"), CLAUDE_CONFIG_DIR: join(dir, "claude") };
   const source = await mediaFixture(dir);
   const sourceRows = (await readFile(source, "utf8")).trim().split("\n").map(line => JSON.parse(line));
+  sourceRows.push({ type: 'system', subtype: 'compact_boundary', uuid: 'source-boundary', parentUuid: null, logicalParentUuid: sourceRows.findLast(row => row.message).uuid });
+  sourceRows.push({ type: 'user', uuid: 'source-summary', parentUuid: 'source-boundary', sessionId: sourceRows[0].sessionId, message: { role: 'user', content: 'Compacted source summary: preserve integer cents; finish CSV.' } });
+  sourceRows.push({ type: 'attachment', attachment: { type: 'nested_memory', content: 'archived-memory-only-'.repeat(30_000) } });
   const notification = '<task-notification><task-id>source-worker</task-id><tool-use-id>original-spawn</tool-use-id><status>failed</status><summary>Weekly limit reached; HTTP 429.</summary><result>Audit saved.</result><worktree><worktreePath>/historical/audit</worktreePath></worktree><future-field>retain me</future-field></task-notification>';
   sourceRows.push({ type: "assistant", uuid: "spawn-call", parentUuid: sourceRows.findLast(row => row.message)?.uuid, sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "original-spawn", name: "Agent", input: { description: "Audit worker", prompt: "Audit integer cents.", run_in_background: true } }] } });
   sourceRows.push({ type: "user", uuid: "spawn-result", parentUuid: "spawn-call", sessionId: sourceRows[0].sessionId, message: { role: "user", content: [{ type: "tool_result", tool_use_id: "original-spawn", content: "Async agent launched successfully. agentId: source-worker. The agent is working in the background." }] } });
@@ -50,7 +53,9 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
   sourceRows.push({ type: "assistant", uuid: "unfinished-call", parentUuid: "broken-paste", sessionId: sourceRows[0].sessionId, message: { role: "assistant", content: [{ type: "tool_use", id: "unfinished", name: "Read", input: { file_path: "missing-result.ts" } }] } });
   await writeFile(source, sourceRows.map(r => JSON.stringify(r)).join("\n") + "\n");
   const exported = Bun.spawn([process.execPath, cli, "convert", source, "--to", "codex", "--install", "--cwd", dir, "--out", join(dir, "bundle"), "--idempotency-key", "native-family", "--json"], { env, stdout: "pipe", stderr: "pipe" });
-  const m = await new Response(exported.stdout).json() as { sessionId: string; installedPath: string; subagents: { sessionId: string; installedPath: string }[] };
+  const exportedText = await new Response(exported.stdout).text();
+  if (await exported.exited !== 0) throw new Error(await new Response(exported.stderr).text());
+  const m = JSON.parse(exportedText) as { sessionId: string; installedPath: string; subagents: { sessionId: string; installedPath: string }[] };
   expect(await exported.exited).toBe(0);
   const proc = Bun.spawn(["codex", "app-server", "--stdio"], { env, stdin: "pipe", stdout: "pipe", stderr: "ignore" });
   const pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
@@ -82,6 +87,12 @@ test("installed Codex app-server hydrates imported user, assistant, and tool his
     const resume = await rpc("thread/resume", { threadId: m.sessionId, path: m.installedPath, cwd: dir });
     const read = await rpc("thread/read", { threadId: m.sessionId, includeTurns: true });
     const turns = await rpc("thread/turns/list", { threadId: m.sessionId, itemsView: "full" });
+    const persisted = (await readFile(m.installedPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
+    const compacted = persisted.findLast(r => r.type === 'compacted');
+    expect(compacted?.payload.replacement_history).toBeDefined();
+    expect(JSON.stringify(compacted.payload.replacement_history)).toContain('Compacted source summary: preserve integer cents; finish CSV.');
+    expect(JSON.stringify(compacted.payload.replacement_history)).not.toContain('archived-memory-only-');
+    expect(JSON.stringify(compacted.payload.replacement_history)).not.toContain('Build invoice export.');
     const native = resume as { approvalPolicy: string; sandbox: { type: string }; thread: { name: string; gitInfo: { branch: string } } };
     expect(native.thread.name).toBe("Invoice export");
     expect(native.thread.gitInfo.branch).toBe("feature/invoice");
