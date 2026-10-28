@@ -2,11 +2,9 @@
 
 Pass the conversation. Keep the context.
 
-Continue a conversation in another coding agent when you hit a usage limit. A local TypeScript CLI running on Bun, with no runtime dependencies or model API calls. Native Codex hydration and title registration use the installed local app-server; no model turn is started.
+Continue a conversation in another coding agent when you hit a usage limit. Baton moves Claude Code and Codex sessions between each other, and to or from ChatGPT, as a local CLI with no model API calls.
 
-Claude Code ↔ Codex CLI use native resumable transcripts. Local Codex Desktop conversations are accepted as input. ChatGPT uses its `conversations.json` export as input and a Markdown handoff as output.
-
-## Start
+## Quick start
 
 Clone and build with [Bun](https://bun.sh). The resulting standalone executable runs without installing runtime dependencies:
 
@@ -15,7 +13,35 @@ git clone https://github.com/tylergibbs1/agent-baton.git
 cd agent-baton
 bun install --frozen-lockfile
 bun run build
+./dist/baton convert claude:latest --to codex --install
 ```
+
+The last command prints a ready-to-run `codex resume ID -C PROJECT` command. To hand off from inside a running session instead, run `./dist/baton setup` once and use `/baton` (see [Hand off the current conversation](#hand-off-the-current-conversation)).
+
+## How it works
+
+```mermaid
+flowchart LR
+  A[Source session<br/>Claude Code, Codex, ChatGPT export] --> B[Typed, provider-neutral session]
+  B --> C[Conversion bundle<br/>checksummed, source archived]
+  C --> D[Native Claude or Codex session<br/>or ChatGPT Markdown handoff]
+```
+
+Baton reads a local transcript, normalizes it into a typed session, and writes a new conversion bundle. With `--install` it also creates a fresh native session in the destination client and prints its resume command. The source session is never modified and no model turn is started.
+
+Claude Code ↔ Codex CLI use native resumable transcripts. Local Codex Desktop conversations are accepted as input. ChatGPT uses its `conversations.json` export as input and a Markdown handoff as output. Native Codex hydration and title registration use the installed local app-server.
+
+## Features
+
+- **Native resume in both directions**: Claude Code → Codex and Codex → Claude Code produce sessions the destination client can resume directly.
+- **Full or active history**: carry the whole branch, or only the post-compaction context with `--history active`. Nothing is silently truncated.
+- **Subagents come along**: Claude child transcripts and Codex child rollouts are exported as separate native subagent transcripts with remapped parents.
+- **Tool history, attachments, and metadata preserved**: tool calls, images, PDFs, titles, timestamps, and usage survive round trips; anything the destination can't interpret stays archived.
+- **One-command handoff**: `setup` installs `/baton` in Claude Code and a Baton skill in Codex.
+- **Safe by default**: dry runs, SHA-256 verification, `undo`, idempotent retries, and workspace checks.
+- **Built for agents too**: JSON Schema contracts, field selection, NDJSON output, and stable exit codes.
+
+## Usage
 
 ```sh
 ./dist/baton list
@@ -24,7 +50,7 @@ bun run build
 ./dist/baton convert claude:latest --to codex --install
 ```
 
-The last command prints a ready-to-run `codex resume ID -C PROJECT` command. For the reverse direction:
+For the reverse direction:
 
 ```sh
 ./dist/baton convert codex:latest --to claude --install
@@ -32,7 +58,7 @@ The last command prints a ready-to-run `codex resume ID -C PROJECT` command. For
 
 Use a full session ID, a unique prefix of at least six characters, or a transcript path when you want a specific conversation. `latest` means the most recently modified local transcript for that provider, including potentially active sessions. `list` excludes Claude subagent transcripts; explicit paths can convert one independently. Parent conversion automatically gathers Claude child transcripts and Codex child rollouts identified by recorded agent IDs; children are exported as separate native subagent transcripts with fresh IDs and remapped parent relationships.
 
-## Run from source
+### Run from source
 
 ```sh
 bun install
@@ -43,7 +69,7 @@ bun run build
 
 To make the source CLI available on your PATH, run `bun link` from this directory. Its entrypoint is `src/cli.ts` and requires Bun. The compiled executable does not.
 
-## Choose how much history to carry
+### Choose how much history to carry
 
 `--history full` is the default. It transfers the selected conversation branch and recovers older Claude history across compaction boundaries. Source bytes, including alternate branches and unsupported records, are archived unchanged.
 
@@ -56,7 +82,7 @@ baton convert claude:latest --to codex --history active --install
 
 No history mode silently truncates messages. Full history can exceed a model's context window; the CLI reports large transfers. Some Claude versions rewrite preserved-message parents after compaction. When the original parent is unavailable before the boundary, the converter uses the final main-conversation message recorded before that boundary and reports this reconstruction. Missing ancestors and excluded branches are also reported.
 
-## Commands
+### Hand off the current conversation
 
 Use the current conversation without looking up its ID:
 
@@ -78,6 +104,8 @@ The commands obtain Claude's `${CLAUDE_SESSION_ID}` or Codex's `CODEX_THREAD_ID`
 
 Setup accepts `--client claude|codex|all`, `--bin /path/to/baton`, and `--dry-run`. It changes only owned Baton skill/helper files, with conflict checks and atomic directory replacement. It does not edit client settings or existing commands.
 
+### Commands
+
 | Command | Purpose |
 | --- | --- |
 | `list` | Discover local sessions; filter by `--source`, `--search`, or `--cwd`; paginate with `--limit` and `--offset` |
@@ -96,7 +124,7 @@ Setup accepts `--client claude|codex|all`, `--bin /path/to/baton`, and `--dry-ru
 
 Targets: `claude`, `codex`, `chatgpt`, `portable`. Use `--out NEW_DIRECTORY` to choose the bundle path. Existing directories are never overwritten. A matching idempotency key can reuse a completed bundle at the same output path. `--cwd PROJECT` changes the destination workspace; installed sessions require an existing directory. Project files are not copied. `CODEX_HOME` and `CLAUDE_CONFIG_DIR` are respected.
 
-## ChatGPT
+### ChatGPT
 
 ```sh
 baton list --input /path/to/conversations.json
@@ -108,7 +136,9 @@ For ChatGPT output, upload `conversation.md` to a new chat and ask it to continu
 
 There is no native ChatGPT desktop/cloud history insertion. Codex native imports are verified with CLI/app-server readers; appearance in the Desktop sidebar is not guaranteed. No desktop database is edited.
 
-## What transfers
+## Reference
+
+### What transfers
 
 - User and assistant text remains in order, including code and user constraints.
 - Tool calls, arguments, outputs, error markers, original roles, and call/result IDs survive native round trips in bridge extensions. Codex readers show native imported tool-history cards with arguments and results. Claude readers receive paired native tool blocks; portable and Markdown outputs retain labeled history. Tools are never replayed or registered. Unfinished source calls are marked inactive with an explicit missing-result error, rather than left live. Mixed messages retain their actual user/assistant prose separately from tool activity.
@@ -118,7 +148,7 @@ There is no native ChatGPT desktop/cloud history insertion. Codex native imports
 - Unknown content blocks become labeled text. UI events, usage counters, provider-specific settings, and source metadata remain archived.
 - Native message timestamps now preserve valid original timestamps. Destination creation time and IDs are fresh; original identity and creation/update times remain in the metadata.
 
-## Metadata conversion
+### Metadata conversion
 
 Version 0.2 introduced typed session/message metadata and an inspectable metadata report. This happens automatically; existing conversion commands continue to work.
 
@@ -144,7 +174,7 @@ Claude streamed/repeated message usage is deduplicated by response identity. Cod
 
 Native Codex registration hydrates stored sessions with `thread/resume` and registers titles without starting a model turn. Hydration populates the native history index; destination-added initialization records are included in the bundle checksums. It uses the installed app-server's local storage API and target account configuration; the converter does not inspect credential files or copy credentials into active destination settings. Metadata may contain sensitive source identifiers, so its files use the same private modes as the conversation bundle.
 
-## Context continuity (0.3)
+### Context continuity (0.3)
 
 Native Claude/Codex conversions create separate child transcripts and remap parent IDs, nesting depth, names, and supported roles. Codex imports include native subagent-call items in the parent transcript and paginated child history. Claude imports use the native `SESSION_ID/subagents/agent-ID.jsonl` layout, metadata sidecars, and completed historical Agent links. The parent retains each child’s last assistant response and a link to its full transcript, while its final main turn remains the continuation point. Imported agents are historical; conversion never starts their work. Claude task notifications with source system provenance become native Codex agent events when their child or spawn ID resolves, preserving chronological failed/completed outcomes and results. Other recognized task notices become readable historical notices. User-authored XML remains user text. Complete notification XML, worktree details, and unknown fields survive in bridge metadata and the archive; in-progress source work is imported paused. Provider-specific roles are preserved in the archive and mapped to supported destination roles. Claude child discovery uses the parent's `SESSION_ID/subagents/` directory. Codex child discovery uses recorded spawn results and collaboration receiver IDs. Original child transcripts and Claude metadata sidecars are archived under `sources/`; structured child messages remain in `context.json`; native child files retain message provenance in bridge extensions. `manifest.json` exposes `subagents` with source IDs, fresh destination IDs, parent IDs, depth, artifact paths, and installed paths. Portable and ChatGPT targets retain supplemental context. Missing, unreadable, and capped discovery is reported. Discovery follows at most 128 transcripts.
 
@@ -169,7 +199,7 @@ baton convert claude:latest --to codex --install --cwd /project --workspace-chec
 
 Attachments are limited to 64 MiB each and 256 MiB total. Invalid/oversized data and changed bundled checksums fail conversion. Missing files and unavailable cloud assets produce explicit warnings. The manifest verifies nested asset and child-source files as well as top-level artifacts.
 
-## Conversion bundle
+### Conversion bundle
 
 ```text
 bridge-exports/NEW_UUID/
@@ -189,7 +219,7 @@ bridge-exports/NEW_UUID/
 
 Bundles have mode `0700`; files have mode `0600`. Conversion creates a fresh UUID and never modifies the source session. Installation uses an exclusive create. Codex titles are registered through local `thread/name/set` storage RPC; failures are reported while the title remains archived. `undo` preflights the parent and every child, refusing the whole operation if any transcript or sidecar changed after installation. Matching idempotent retries reuse the same child IDs and check all installed family members. Registered Codex imports are removed through local `thread/delete` so their native title/index metadata is removed too.
 
-## Agent use (0.4)
+### Agent use (0.4)
 
 The command definitions and input validation share one contract. `schema COMMAND --json` returns JSON Schema for request and full-result shapes, whether the command mutates storage, and the trust boundary. `COMMAND --help --json` returns the same machine-readable contract. Input schemas use literal flag names; positional session/bundle references become `session` or `bundle` in JSON requests. Defaults are published in the schemas. Unknown fields, wrong types, invalid enums, control characters, and invalid selectors fail before writes. Semantic checks such as install capabilities and workspace existence still run after shape validation.
 
@@ -227,7 +257,7 @@ baton list --page-all --max-pages 3 --limit 20 --output ndjson \
 
 NDJSON list output emits one page per line from one discovery traversal. `--page-all` defaults to a ten-page cap; `--max-pages` bounds it explicitly. If the final `complete` is false, continue at `nextOffset`. JSON page-all output collects the bounded pages into a sessions array and includes `pageCount`. Field selection applies per page for NDJSON and to the collected result for JSON. Discovery is a point-in-time traversal; across separate invocations a newly modified session can shift offset ordering.
 
-### Safe conversion retries
+#### Safe conversion retries
 
 `inspect` exposes `sourceSha256`; supply it as `--expected-source-sha256` to reject a different donor snapshot with `SOURCE_CHANGED`. The guard pins the loaded donor bytes, while the conversion archives that snapshot. For retrying conversion after losing a command response, supply a stable `--idempotency-key` and explicit `--out`. Matching source/child/asset bytes, destination, branch/history, install mode, and workspace-check policy reuse the completed receipt and session ID. Changing the request yields `IDEMPOTENCY_CONFLICT`. Dry runs neither write nor reserve the key.
 
@@ -237,7 +267,7 @@ Success results go to stdout. Error JSON goes to stderr with `code`, `message`, 
 
 Exit codes: `0` success, `2` rejected input/I/O failure, `3` failed integrity check. The CLI has no prompts and never starts a model turn. These changes follow [OpenAI's CLI patterns](https://github.com/openai/skills/blob/main/skills/.curated/cli-creator/references/agent-cli-patterns.md) and the [Command Line Interface Guidelines](https://clig.dev/).
 
-## Validation and format limits
+## Development and validation
 
 ```sh
 bun run typecheck
@@ -264,3 +294,7 @@ Generated transfer context, supplemental memory, and workspace checks remain ava
 Claude peer messages are displayed as attributed historical assistant messages, rather than user instructions. Paired `pasted_content` wrappers in human messages become quoted sections. Original roles, wrappers, sender metadata, and text remain in the inverse bridge and source archive; malformed wrappers and literal peer XML in human messages are retained unchanged.
 
 Large Codex imports with a recorded source compaction retain full paginated display history but resume model context from that genuine source boundary. Older supplemental records stay in the bundle and are referenced for retrieval rather than replayed. The replacement context must fit a conservative 400 KB serialized budget; larger replacements fail explicitly rather than dropping messages. Imports without a source compaction retain the existing full-history warning.
+
+## License
+
+[MIT](LICENSE)
